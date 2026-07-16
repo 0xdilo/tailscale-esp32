@@ -3,11 +3,12 @@ use std::net::SocketAddr;
 
 use thiserror::Error;
 
-use super::control::{HostInfo, MapRequest, MapResponse};
+use super::control::{HostInfo, MapRequest, MapResponse, RegisterRequest, RegisterResponse};
 use super::identity::{DeviceIdentity, IdentityError, NodeKeyRotation, ENCODED_IDENTITY_LEN};
 use super::key::{Node, PublicKey};
 use super::netmap::{parse_ip_packet, IpPacket, NetworkMap, PacketError};
 use super::paths::{EndpointTracker, PathError, Probe, Route};
+use super::tailnet_lock::{resign_node_key_signature, TailnetLockError};
 
 pub trait IdentityStorage {
     type Error;
@@ -49,6 +50,124 @@ pub trait PacketDevice {
 pub struct MapResumeState {
     pub handle: String,
     pub sequence: i64,
+}
+
+/// Bounded exponential retry schedule with deterministic jitter. Keep one
+/// instance per remote service and call [`Self::reset`] after a stable session.
+pub struct ReconnectBackoff {
+    attempt: u8,
+    random: u64,
+    minimum_ms: u64,
+    maximum_ms: u64,
+}
+
+pub struct NodeKeyRotationFlow {
+    rotation: NodeKeyRotation,
+    node_key_signature: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RotationStatus {
+    RetryWithSignature,
+    Accepted,
+    ApprovalRequired(String),
+}
+
+impl NodeKeyRotationFlow {
+    pub fn begin(identity: &DeviceIdentity) -> Result<Self, IdentityError> {
+        Ok(Self {
+            rotation: identity.prepare_node_key_rotation()?,
+            node_key_signature: Vec::new(),
+        })
+    }
+
+    pub fn request(
+        &self,
+        identity: &DeviceIdentity,
+        version: u16,
+        host_info: HostInfo,
+    ) -> RegisterRequest {
+        RegisterRequest::new(
+            version,
+            self.rotation.replacement().public(),
+            identity.network_lock_key().public(),
+            host_info,
+        )
+        .rotating_from(self.rotation.old_public())
+        .with_node_key_signature(self.node_key_signature.clone())
+    }
+
+    pub fn handle_response(
+        &mut self,
+        identity: &DeviceIdentity,
+        response: &RegisterResponse,
+    ) -> Result<RotationStatus, RotationError> {
+        if !response.error.is_empty() {
+            return Err(RotationError::Control(response.error.clone()));
+        }
+        if !response.node_key_signature.is_empty() {
+            self.node_key_signature = resign_node_key_signature(
+                identity.network_lock_key(),
+                self.rotation.replacement().public(),
+                &response.node_key_signature,
+            )?;
+            return Ok(RotationStatus::RetryWithSignature);
+        }
+        if response.node_key_expired {
+            return Err(RotationError::ReplacementRejectedAsExpired);
+        }
+        if response.machine_authorized {
+            return Ok(RotationStatus::Accepted);
+        }
+        if !response.auth_url.is_empty() {
+            return Ok(RotationStatus::ApprovalRequired(response.auth_url.clone()));
+        }
+        Err(RotationError::UnauthorizedWithoutApprovalUrl)
+    }
+
+    pub fn commit<S: IdentityStorage>(
+        &self,
+        runtime: &mut TailnetRuntime,
+        storage: &mut S,
+    ) -> Result<(), RuntimeStorageError<S::Error>> {
+        runtime.commit_node_key_rotation(storage, &self.rotation)
+    }
+}
+
+impl ReconnectBackoff {
+    pub fn new(seed: u64) -> Self {
+        Self {
+            attempt: 0,
+            random: seed.max(1),
+            minimum_ms: 1_000,
+            maximum_ms: 300_000,
+        }
+    }
+
+    pub fn with_limits(seed: u64, minimum_ms: u64, maximum_ms: u64) -> Self {
+        let mut backoff = Self::new(seed);
+        backoff.minimum_ms = minimum_ms.max(1);
+        backoff.maximum_ms = maximum_ms.max(backoff.minimum_ms);
+        backoff
+    }
+
+    pub fn next_delay_millis(&mut self) -> u64 {
+        let multiplier = 1_u64 << self.attempt.min(20);
+        let base = self
+            .minimum_ms
+            .saturating_mul(multiplier)
+            .min(self.maximum_ms);
+        self.attempt = self.attempt.saturating_add(1);
+        self.random ^= self.random << 13;
+        self.random ^= self.random >> 7;
+        self.random ^= self.random << 17;
+        let jitter_percent = 75 + self.random % 51;
+        base.saturating_mul(jitter_percent) / 100
+    }
+
+    pub fn reset(&mut self) {
+        self.attempt = 0;
+    }
 }
 
 pub struct TailnetRuntime {
@@ -275,9 +394,24 @@ pub enum PacketDeliveryError<E> {
     Device(E),
 }
 
+#[derive(Debug, Error)]
+pub enum RotationError {
+    #[error("control rejected node-key rotation: {0}")]
+    Control(String),
+    #[error("tailnet-lock re-signing failed: {0}")]
+    TailnetLock(#[from] TailnetLockError),
+    #[error("control rejected the replacement node key as already expired")]
+    ReplacementRejectedAsExpired,
+    #[error("rotated node is unauthorized and control returned no approval URL")]
+    UnauthorizedWithoutApprovalUrl,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{IdentityStorage, TailnetRuntime};
+    use super::{
+        IdentityStorage, NodeKeyRotationFlow, ReconnectBackoff, RotationStatus, TailnetRuntime,
+    };
+    use crate::control::{HostInfo, RegisterResponse};
 
     #[derive(Default)]
     struct MemoryStorage(Option<Vec<u8>>);
@@ -317,5 +451,40 @@ mod tests {
             restored.identity().node_key().public(),
             runtime.identity().node_key().public()
         );
+    }
+
+    #[test]
+    fn reconnect_backoff_grows_caps_and_resets() {
+        let mut backoff = ReconnectBackoff::with_limits(7, 1_000, 30_000);
+        let delays: Vec<_> = (0..12).map(|_| backoff.next_delay_millis()).collect();
+        assert!((750..=1_250).contains(&delays[0]));
+        assert!(delays[5..].iter().all(|delay| *delay <= 37_500));
+        assert!(delays[5..].iter().all(|delay| *delay >= 22_500));
+        backoff.reset();
+        assert!((750..=1_250).contains(&backoff.next_delay_millis()));
+    }
+
+    #[test]
+    fn rotation_flow_builds_old_to_new_registration_and_commits_after_acceptance() {
+        let mut storage = MemoryStorage::default();
+        let mut runtime = TailnetRuntime::load_or_create(&mut storage).unwrap();
+        let old_node = runtime.identity().node_key().public();
+        let mut flow = NodeKeyRotationFlow::begin(runtime.identity()).unwrap();
+        let request = flow.request(runtime.identity(), 142, HostInfo::esp32("esp32", "backend"));
+        assert_eq!(request.old_node_key, old_node);
+        assert_ne!(request.node_key, old_node);
+        let response = RegisterResponse {
+            node_key_expired: false,
+            machine_authorized: true,
+            auth_url: String::new(),
+            error: String::new(),
+            node_key_signature: Vec::new(),
+        };
+        assert_eq!(
+            flow.handle_response(runtime.identity(), &response).unwrap(),
+            RotationStatus::Accepted
+        );
+        flow.commit(&mut runtime, &mut storage).unwrap();
+        assert_ne!(runtime.identity().node_key().public(), old_node);
     }
 }

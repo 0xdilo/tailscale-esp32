@@ -162,6 +162,12 @@ pub struct MapRequest {
     pub endpoints: Vec<String>,
     #[serde(rename = "EndpointTypes", skip_serializing_if = "Vec::is_empty")]
     pub endpoint_types: Vec<u8>,
+    #[serde(rename = "MapSessionHandle", skip_serializing_if = "String::is_empty")]
+    pub map_session_handle: String,
+    #[serde(rename = "MapSessionSeq", skip_serializing_if = "is_zero_i64")]
+    pub map_session_seq: i64,
+    #[serde(rename = "OmitPeers", skip_serializing_if = "std::ops::Not::not")]
+    pub omit_peers: bool,
 }
 
 impl MapRequest {
@@ -180,8 +186,26 @@ impl MapRequest {
             host_info,
             endpoints: Vec::new(),
             endpoint_types: Vec::new(),
+            map_session_handle: String::new(),
+            map_session_seq: 0,
+            omit_peers: false,
         }
     }
+
+    pub fn streaming(mut self) -> Self {
+        self.stream = true;
+        self
+    }
+
+    pub fn resume(mut self, handle: impl Into<String>, sequence: i64) -> Self {
+        self.map_session_handle = handle.into();
+        self.map_session_seq = sequence;
+        self
+    }
+}
+
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -240,8 +264,82 @@ pub struct FilterRule {
     pub ip_protocols: Vec<i16>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct DerpMap {
+    #[serde(rename = "Regions", default)]
+    pub regions: BTreeMap<u16, DerpRegion>,
+    #[serde(rename = "OmitDefaultRegions", default)]
+    pub omit_default_regions: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct DerpRegion {
+    #[serde(rename = "RegionID", default)]
+    pub region_id: u16,
+    #[serde(rename = "RegionCode", default)]
+    pub region_code: String,
+    #[serde(rename = "RegionName", default)]
+    pub region_name: String,
+    #[serde(rename = "NoMeasureNoHome", default)]
+    pub no_measure_no_home: bool,
+    #[serde(rename = "Nodes", default)]
+    pub nodes: Vec<DerpNode>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct DerpNode {
+    #[serde(rename = "Name", default)]
+    pub name: String,
+    #[serde(rename = "RegionID", default)]
+    pub region_id: u16,
+    #[serde(rename = "HostName", default)]
+    pub host_name: String,
+    #[serde(rename = "CertName", default)]
+    pub cert_name: String,
+    #[serde(rename = "IPv4", default)]
+    pub ipv4: String,
+    #[serde(rename = "IPv6", default)]
+    pub ipv6: String,
+    #[serde(rename = "STUNPort", default)]
+    pub stun_port: i16,
+    #[serde(rename = "STUNOnly", default)]
+    pub stun_only: bool,
+    #[serde(rename = "DERPPort", default)]
+    pub derp_port: u16,
+}
+
+impl DerpNode {
+    pub fn relay_port(&self) -> u16 {
+        if self.derp_port == 0 {
+            443
+        } else {
+            self.derp_port
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct PeerChange {
+    #[serde(rename = "NodeID", default)]
+    pub node_id: u64,
+    #[serde(rename = "DERPRegion", default)]
+    pub derp_region: u16,
+    #[serde(rename = "Endpoints", default)]
+    pub endpoints: Vec<String>,
+    #[serde(rename = "Key", default)]
+    pub key: Option<PublicKey<Node>>,
+    #[serde(rename = "DiscoKey", default)]
+    pub disco_key: Option<PublicKey<Disco>>,
+    #[serde(rename = "Online", default)]
+    pub online: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct MapResponse {
+    #[serde(rename = "MapSessionHandle", default)]
+    pub map_session_handle: String,
+    #[serde(rename = "Seq", default)]
+    pub sequence: i64,
     #[serde(rename = "KeepAlive", default)]
     pub keep_alive: bool,
     #[serde(rename = "Node", default)]
@@ -252,6 +350,10 @@ pub struct MapResponse {
     pub peers_changed: Vec<NodeInfo>,
     #[serde(rename = "PeersRemoved", default)]
     pub peers_removed: Vec<u64>,
+    #[serde(rename = "PeersChangedPatch", default)]
+    pub peers_changed_patch: Vec<PeerChange>,
+    #[serde(rename = "DERPMap", default)]
+    pub derp_map: Option<DerpMap>,
     #[serde(rename = "PacketFilter", default)]
     pub packet_filter: Option<Vec<FilterRule>>,
     #[serde(rename = "PacketFilters", default)]
@@ -308,8 +410,10 @@ pub enum MapDecodeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlKeys, HostInfo, MapStreamDecoder, RegisterRequest, RegisterResponse};
-    use crate::key::{NetworkLock, Node, PublicKey};
+    use super::{
+        ControlKeys, HostInfo, MapRequest, MapStreamDecoder, RegisterRequest, RegisterResponse,
+    };
+    use crate::key::{Disco, NetworkLock, Node, PublicKey};
 
     #[test]
     fn parses_current_control_key_response() {
@@ -371,5 +475,41 @@ mod tests {
         let messages = decoder.push(&encoded[5..]).unwrap();
         assert_eq!(messages.len(), 1);
         assert!(messages[0].keep_alive);
+    }
+
+    #[test]
+    fn serializes_resumable_stream_request() {
+        let request = MapRequest::new(
+            142,
+            PublicKey::<Node>::from_bytes([3; 32]),
+            PublicKey::<Disco>::from_bytes([4; 32]),
+            HostInfo::esp32("esp32", "backend"),
+        )
+        .streaming()
+        .resume("map-session", 27);
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["Stream"], true);
+        assert_eq!(value["KeepAlive"], true);
+        assert_eq!(value["MapSessionHandle"], "map-session");
+        assert_eq!(value["MapSessionSeq"], 27);
+    }
+
+    #[test]
+    fn parses_derp_map_and_peer_patch() {
+        let response = serde_json::from_str::<super::MapResponse>(
+            r#"{
+                "Seq":9,
+                "PeersChangedPatch":[{"NodeID":7,"DERPRegion":2,"Online":true}],
+                "DERPMap":{"Regions":{"2":{"RegionID":2,"RegionCode":"nyc","Nodes":[
+                    {"Name":"2a","RegionID":2,"HostName":"derp2.tailscale.com"}
+                ]}}}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(response.sequence, 9);
+        assert_eq!(response.peers_changed_patch[0].node_id, 7);
+        let node = &response.derp_map.unwrap().regions[&2].nodes[0];
+        assert_eq!(node.host_name, "derp2.tailscale.com");
+        assert_eq!(node.relay_port(), 443);
     }
 }

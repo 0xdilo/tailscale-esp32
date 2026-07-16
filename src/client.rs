@@ -7,7 +7,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::h2::{Frame, H2Error, HeaderCodec, Response, ResponseAssembler, CLIENT_PREFACE};
+use super::h2::{
+    Frame, H2Error, HeaderCodec, Response, ResponseAssembler, StreamEvent, StreamResponseAssembler,
+    CLIENT_PREFACE,
+};
 use super::key::{Challenge, Machine, PrivateKey, PublicKey};
 use super::noise::{NoiseError, NoiseInitiator, NoiseTransport, MAX_PLAINTEXT_LEN};
 
@@ -29,6 +32,12 @@ pub struct ControlConnection<S> {
     next_stream_id: u32,
     early_noise: EarlyNoise,
     authority: String,
+}
+
+pub struct ControlStream {
+    stream_id: u32,
+    assembler: StreamResponseAssembler,
+    ended: bool,
 }
 
 impl<S: Read + Write> ControlConnection<S> {
@@ -209,6 +218,85 @@ impl<S: Read + Write> ControlConnection<S> {
         Err(ControlClientError::TooManyResponseFrames)
     }
 
+    pub fn start_json_stream<T: Serialize>(
+        &mut self,
+        path: &str,
+        body: &T,
+        load_balance_keys: &[&str],
+    ) -> Result<ControlStream, ControlClientError> {
+        let body = serde_json::to_vec(body)?;
+        let headers: Vec<_> = load_balance_keys
+            .iter()
+            .map(|key| ("ts-lb", *key))
+            .collect();
+        let stream_id = self.allocate_stream_id()?;
+        let frames =
+            self.headers
+                .request(stream_id, "POST", path, &self.authority, &body, &headers)?;
+        for frame in frames {
+            self.write_h2_frame(frame)?;
+        }
+        Ok(ControlStream {
+            stream_id,
+            assembler: StreamResponseAssembler::new(stream_id)?,
+            ended: false,
+        })
+    }
+
+    pub fn read_stream_event(
+        &mut self,
+        stream: &mut ControlStream,
+    ) -> Result<StreamEvent, ControlClientError> {
+        if stream.ended {
+            return Err(ControlClientError::StreamEnded(stream.stream_id));
+        }
+        loop {
+            let frame = self.read_h2_frame()?;
+            if frame.is_settings() {
+                self.write_h2_frame(Frame::settings_ack())?;
+                continue;
+            }
+            if frame.is_ping_request() {
+                self.write_h2_frame(Frame::ping_ack(frame.payload)?)?;
+                continue;
+            }
+            if frame.is_connection_error() {
+                return Err(ControlClientError::ConnectionClosed);
+            }
+            if frame.is_stream_error(stream.stream_id) {
+                return Err(ControlClientError::StreamReset(stream.stream_id));
+            }
+            let data_len = if frame.kind == 0 && frame.stream_id == stream.stream_id {
+                u32::try_from(frame.payload.len()).unwrap_or(u32::MAX)
+            } else {
+                0
+            };
+            let Some(event) = stream.assembler.push(frame, &mut self.headers)? else {
+                continue;
+            };
+            if data_len > 0 {
+                self.write_h2_frame(Frame::window_update(0, data_len)?)?;
+                self.write_h2_frame(Frame::window_update(stream.stream_id, data_len)?)?;
+            }
+            stream.ended = match &event {
+                StreamEvent::Headers { end_stream, .. } | StreamEvent::Data { end_stream, .. } => {
+                    *end_stream
+                }
+            };
+            return Ok(event);
+        }
+    }
+
+    fn allocate_stream_id(&mut self) -> Result<u32, ControlClientError> {
+        let stream_id = self.next_stream_id;
+        self.next_stream_id = self
+            .next_stream_id
+            .checked_add(2)
+            .filter(|id| *id <= 0x7fff_ffff)
+            .ok_or(ControlClientError::StreamIdsExhausted)?;
+        Ok(stream_id)
+    }
+
     fn write_h2_frame(&mut self, frame: Frame) -> Result<(), ControlClientError> {
         self.write_plain(&frame.encode()?)
     }
@@ -328,6 +416,8 @@ pub enum ControlClientError {
     ConnectionClosed,
     #[error("control reset HTTP/2 stream {0}")]
     StreamReset(u32),
+    #[error("control HTTP/2 stream {0} has already ended")]
+    StreamEnded(u32),
     #[error("control response exceeded the frame count limit")]
     TooManyResponseFrames,
     #[error("control returned HTTP {status}: {body}")]

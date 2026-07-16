@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use thiserror::Error;
 
-use super::control::{FilterRule, MapResponse, NodeInfo};
+use super::control::{DerpMap, FilterRule, MapResponse, NodeInfo};
 use super::key::{Disco, Node, PublicKey};
 
 const TCP: u8 = 6;
@@ -17,6 +17,7 @@ pub struct NetworkMap {
     pub self_node: Option<NodeInfo>,
     peers: BTreeMap<u64, NodeInfo>,
     peer_routes: BTreeMap<PublicKey<Node>, Vec<IpPattern>>,
+    derp_map: Option<DerpMap>,
     filters: BTreeMap<String, Vec<CompiledRule>>,
     filters_received: bool,
 }
@@ -43,6 +44,34 @@ impl NetworkMap {
             if let Some(peer) = self.peers.remove(&id) {
                 self.peer_routes.remove(&peer.key);
             }
+        }
+        for change in response.peers_changed_patch {
+            let Some(peer) = self.peers.get_mut(&change.node_id) else {
+                continue;
+            };
+            let previous_key = peer.key;
+            if change.derp_region != 0 {
+                peer.home_derp = change.derp_region;
+            }
+            if !change.endpoints.is_empty() {
+                peer.endpoints = change.endpoints;
+            }
+            if let Some(key) = change.key {
+                peer.key = key;
+            }
+            if let Some(disco_key) = change.disco_key {
+                peer.disco_key = disco_key;
+            }
+            if let Some(online) = change.online {
+                peer.online = Some(online);
+            }
+            if peer.key != previous_key {
+                let routes = self.peer_routes.remove(&previous_key).unwrap_or_default();
+                self.peer_routes.insert(peer.key, routes);
+            }
+        }
+        if let Some(derp_map) = response.derp_map {
+            self.derp_map = Some(derp_map);
         }
 
         if let Some(rules) = response.packet_filter {
@@ -118,6 +147,10 @@ impl NetworkMap {
         self.peers
             .values()
             .any(|peer| peer.key == node_key && peer.disco_key == disco_key)
+    }
+
+    pub fn derp_map(&self) -> Option<&DerpMap> {
+        self.derp_map.as_ref()
     }
 
     pub fn peer_allows_source(&self, key: PublicKey<Node>, address: IpAddr) -> bool {
@@ -510,18 +543,13 @@ mod tests {
     use super::{
         icmp_echo_reply, icmp_echo_reply_in_place, internet_checksum, parse_udp_packet, NetworkMap,
     };
-    use crate::control::{FilterRule, MapResponse, NetPortRange, NodeInfo, PortRange};
+    use crate::control::{FilterRule, MapResponse, NetPortRange, NodeInfo, PeerChange, PortRange};
     use crate::key::{Disco, Machine, Node, PublicKey};
 
     fn response_with_rules(rules: Vec<FilterRule>) -> MapResponse {
         MapResponse {
-            keep_alive: false,
-            node: None,
-            peers: None,
-            peers_changed: Vec::new(),
-            peers_removed: Vec::new(),
             packet_filter: Some(rules),
-            packet_filters: BTreeMap::new(),
+            ..MapResponse::default()
         }
     }
 
@@ -590,13 +618,8 @@ mod tests {
         replacement.source_ips = vec!["100.101.1.1".into()];
         packet_filters.insert("replacement".into(), Some(vec![replacement]));
         map.apply(MapResponse {
-            keep_alive: false,
-            node: None,
-            peers: None,
-            peers_changed: Vec::new(),
-            peers_removed: Vec::new(),
-            packet_filter: None,
             packet_filters,
+            ..MapResponse::default()
         });
         assert!(map.allows(
             "100.101.1.1".parse().unwrap(),
@@ -633,6 +656,37 @@ mod tests {
         removed.peers_removed = vec![7];
         map.apply(removed);
         assert!(!map.contains_peer(key));
+    }
+
+    #[test]
+    fn applies_peer_patches_and_moves_routes_when_the_key_rotates() {
+        let old_key = PublicKey::<Node>::from_bytes([7; 32]);
+        let new_key = PublicKey::<Node>::from_bytes([8; 32]);
+        let new_disco_key = PublicKey::<Disco>::from_bytes([9; 32]);
+        let mut map = NetworkMap::default();
+        let mut response = response_with_rules(Vec::new());
+        response.peers = Some(vec![peer(7, 7, &["100.70.0.0/16"])]);
+        map.apply(response);
+
+        let mut patch = response_with_rules(Vec::new());
+        patch.peers_changed_patch.push(PeerChange {
+            node_id: 7,
+            derp_region: 4,
+            endpoints: vec!["192.0.2.1:41641".into()],
+            key: Some(new_key),
+            disco_key: Some(new_disco_key),
+            online: Some(false),
+        });
+        map.apply(patch);
+
+        assert!(!map.contains_peer(old_key));
+        assert!(map.contains_peer(new_key));
+        assert!(map.peer_allows_source(new_key, "100.70.1.2".parse().unwrap()));
+        let updated = map.peers().find(|peer| peer.id == 7).unwrap();
+        assert_eq!(updated.home_derp, 4);
+        assert_eq!(updated.endpoints, ["192.0.2.1:41641"]);
+        assert_eq!(updated.disco_key, new_disco_key);
+        assert_eq!(updated.online, Some(false));
     }
 
     #[test]

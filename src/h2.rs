@@ -41,6 +41,13 @@ impl Frame {
         Self::new(8, 0, 0, increment.to_be_bytes().to_vec())
     }
 
+    pub fn window_update(stream_id: u32, increment: u32) -> Result<Self, H2Error> {
+        if increment == 0 || increment > 0x7fff_ffff {
+            return Err(H2Error::InvalidWindowIncrement(increment));
+        }
+        Ok(Self::new(8, 0, stream_id, increment.to_be_bytes().to_vec()))
+    }
+
     pub fn ping_ack(payload: Vec<u8>) -> Result<Self, H2Error> {
         if payload.len() != 8 {
             return Err(H2Error::InvalidPing);
@@ -200,6 +207,110 @@ pub struct ResponseAssembler {
     max_body_len: usize,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum StreamEvent {
+    Headers {
+        status: u16,
+        headers: Vec<(String, String)>,
+        end_stream: bool,
+    },
+    Data {
+        payload: Vec<u8>,
+        end_stream: bool,
+    },
+}
+
+pub struct StreamResponseAssembler {
+    stream_id: u32,
+    header_block: Vec<u8>,
+    headers_received: bool,
+    expecting_continuation: bool,
+    headers_end_stream: bool,
+}
+
+impl StreamResponseAssembler {
+    pub fn new(stream_id: u32) -> Result<Self, H2Error> {
+        if stream_id == 0 {
+            return Err(H2Error::InvalidStreamId(stream_id));
+        }
+        Ok(Self {
+            stream_id,
+            header_block: Vec::new(),
+            headers_received: false,
+            expecting_continuation: false,
+            headers_end_stream: false,
+        })
+    }
+
+    pub fn push(
+        &mut self,
+        frame: Frame,
+        codec: &mut HeaderCodec,
+    ) -> Result<Option<StreamEvent>, H2Error> {
+        if frame.stream_id != self.stream_id {
+            return Ok(None);
+        }
+        if self.expecting_continuation && frame.kind != CONTINUATION {
+            return Err(H2Error::ExpectedContinuation);
+        }
+        match frame.kind {
+            HEADERS => {
+                if self.headers_received || self.expecting_continuation {
+                    return Err(H2Error::UnexpectedHeaders);
+                }
+                self.header_block
+                    .extend_from_slice(headers_fragment(&frame)?);
+                self.expecting_continuation = frame.flags & END_HEADERS == 0;
+                self.headers_end_stream = frame.flags & END_STREAM != 0;
+                if self.expecting_continuation {
+                    Ok(None)
+                } else {
+                    self.finish_headers(codec).map(Some)
+                }
+            }
+            CONTINUATION => {
+                if !self.expecting_continuation {
+                    return Err(H2Error::ExpectedHeaders);
+                }
+                self.header_block.extend_from_slice(&frame.payload);
+                self.expecting_continuation = frame.flags & END_HEADERS == 0;
+                if self.expecting_continuation {
+                    Ok(None)
+                } else {
+                    self.finish_headers(codec).map(Some)
+                }
+            }
+            DATA => {
+                if !self.headers_received || self.expecting_continuation {
+                    return Err(H2Error::ExpectedHeaders);
+                }
+                Ok(Some(StreamEvent::Data {
+                    payload: data_fragment(&frame)?.to_vec(),
+                    end_stream: frame.flags & END_STREAM != 0,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn finish_headers(&mut self, codec: &mut HeaderCodec) -> Result<StreamEvent, H2Error> {
+        let headers = codec.decode(std::mem::take(&mut self.header_block))?;
+        let status = headers
+            .iter()
+            .find(|(name, _)| name == ":status")
+            .ok_or(H2Error::MissingStatus)?
+            .1
+            .parse()
+            .map_err(|_| H2Error::InvalidStatus)?;
+        self.headers_received = true;
+        Ok(StreamEvent::Headers {
+            status,
+            headers,
+            end_stream: self.headers_end_stream,
+        })
+    }
+}
+
 impl ResponseAssembler {
     pub fn new(stream_id: u32, max_body_len: usize) -> Result<Self, H2Error> {
         if stream_id == 0 {
@@ -349,13 +460,18 @@ pub enum H2Error {
     BodyTooLarge(usize),
     #[error("HTTP/2 PING payload must be exactly eight bytes")]
     InvalidPing,
+    #[error("invalid HTTP/2 window increment {0}")]
+    InvalidWindowIncrement(u32),
 }
 
 #[cfg(test)]
 mod tests {
     use httlib_hpack::Encoder;
 
-    use super::{Frame, HeaderCodec, ResponseAssembler, DATA, END_HEADERS, END_STREAM, HEADERS};
+    use super::{
+        Frame, HeaderCodec, ResponseAssembler, StreamEvent, StreamResponseAssembler, DATA,
+        END_HEADERS, END_STREAM, HEADERS,
+    };
 
     #[test]
     fn frame_round_trips() {
@@ -410,5 +526,61 @@ mod tests {
             .unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"ok");
+    }
+
+    #[test]
+    fn streams_headers_and_data_without_buffering_the_body() {
+        let mut encoder = HeaderCodec::default();
+        let mut block = Vec::new();
+        encoder
+            .encoder
+            .encode(
+                (b":status".to_vec(), b"200".to_vec(), Encoder::BEST_FORMAT),
+                &mut block,
+            )
+            .unwrap();
+        let mut decoder = HeaderCodec::default();
+        let mut assembler = StreamResponseAssembler::new(1).unwrap();
+        assert!(matches!(
+            assembler
+                .push(Frame::new(HEADERS, END_HEADERS, 1, block), &mut decoder)
+                .unwrap(),
+            Some(StreamEvent::Headers {
+                status: 200,
+                end_stream: false,
+                ..
+            })
+        ));
+        assert_eq!(
+            assembler
+                .push(Frame::new(DATA, 0, 1, b"first".to_vec()), &mut decoder)
+                .unwrap(),
+            Some(StreamEvent::Data {
+                payload: b"first".to_vec(),
+                end_stream: false,
+            })
+        );
+        assert_eq!(
+            assembler
+                .push(
+                    Frame::new(DATA, END_STREAM, 1, b"last".to_vec()),
+                    &mut decoder,
+                )
+                .unwrap(),
+            Some(StreamEvent::Data {
+                payload: b"last".to_vec(),
+                end_stream: true,
+            })
+        );
+    }
+
+    #[test]
+    fn validates_window_updates() {
+        assert_eq!(
+            Frame::window_update(3, 1024).unwrap().payload,
+            1024_u32.to_be_bytes()
+        );
+        assert!(Frame::window_update(0, 0).is_err());
+        assert!(Frame::window_update(0, 0x8000_0000).is_err());
     }
 }

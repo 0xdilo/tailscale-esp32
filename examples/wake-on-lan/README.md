@@ -114,9 +114,11 @@ For defense-in-depth application authentication:
 ./scripts/wake-tailscale.sh esp32-wake
 ```
 
-## Current network limitation
+## Direct and relayed connectivity
 
-The reference firmware maintains a direct UDP mapping and advertises it to the
-control plane. DERP is not implemented, so remote access can fail when either
-side blocks UDP or the home router uses an incompatible NAT. Keep a Raspberry
-Pi or another full Tailscale node as a relay/fallback for unattended systems.
+The reference firmware maintains a direct UDP mapping, processes authenticated
+CallMeMaybe endpoint updates, and keeps an authenticated connection to its
+selected home DERP region. Direct UDP is preferred; WireGuard packets fall back
+to DERP when a firewall or difficult NAT prevents a direct path. The control
+connection uses resumable streaming maps and republishes endpoint or preferred
+DERP changes without losing its persistent node identity.

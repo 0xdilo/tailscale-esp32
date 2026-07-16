@@ -16,10 +16,10 @@ ESP-IDF 5.4.3. The comparison uses the same application and dependency set.
 | `.flash.rodata` | 380,380 B | 279,428 B | -100,952 B (-26.5%) |
 | Explicit application task stacks | 98 KiB | 78 KiB | -20 KiB (-20.4%) |
 
-The completed relay/streaming runtime build measures 1,440,208 B as a
-flashable image (`.flash.text` 1,032,636 B and `.flash.rodata` 286,172 B).
-That is 59,024 B larger than the direct-only optimized build while remaining
-174,624 B smaller than the initial release. Its dedicated DERP/TLS task adds a
+The completed relay/streaming runtime build measures 1,440,224 B as a
+flashable image (`.flash.text` 1,032,656 B and `.flash.rodata` 286,172 B).
+That is 59,040 B larger than the direct-only optimized build while remaining
+174,608 B smaller than the initial release. Its dedicated DERP/TLS task adds a
 40 KiB bounded stack; it is the reliability cost of accepting traffic when UDP
 is blocked or both peers are behind difficult NATs.
 

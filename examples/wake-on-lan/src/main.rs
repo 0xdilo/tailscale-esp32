@@ -786,7 +786,7 @@ fn tailscale_data(
                     }
                 }
             }
-            info!("sent direct-path probes requested by {}", probe.peer);
+            info!("sent direct-path probes requested by {:?}", probe.peer);
         }
         if last_stun.elapsed() >= STUN_INTERVAL {
             getrandom::getrandom(&mut stun_transaction)

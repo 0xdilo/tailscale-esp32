@@ -18,6 +18,9 @@ by Tailscale Inc.
 > replacement for `tailscaled`. Read the [support matrix](docs/protocol-support.md)
 > before selecting it for a deployment.
 
+The ESP32-S3 reference build is tuned for constrained always-on appliances.
+See the measured [footprint, memory, and idle-power optimizations](docs/optimization.md).
+
 ## What is implemented
 
 - Tailscale machine, node, discovery, challenge, and network-lock key types

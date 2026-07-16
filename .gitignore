@@ -1,0 +1,9 @@
+target/
+**/target/
+.env
+**/.env
+sdkconfig
+sdkconfig.old
+**/sdkconfig
+**/sdkconfig.old
+.DS_Store

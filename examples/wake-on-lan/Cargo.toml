@@ -1,0 +1,32 @@
+[package]
+name = "tailscale-esp32-wake-example"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+[[bin]]
+name = "tailscale-esp32-wake"
+path = "src/main.rs"
+harness = false
+required-features = ["firmware"]
+
+[dependencies]
+getrandom = "0.2"
+hmac = "0.12"
+sha2 = "0.10"
+tailscale-esp32 = { path = "../.." }
+
+[features]
+default = []
+firmware = []
+
+[target.'cfg(target_os = "espidf")'.dependencies]
+anyhow = "1"
+embedded-svc = "0.29"
+esp-idf-svc = "0.52.1"
+log = "0.4"
+serde_json = "1"
+
+[build-dependencies]
+embuild = { version = "0.33", features = ["espidf"] }

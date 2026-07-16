@@ -11,6 +11,7 @@
 
 pub mod client;
 pub mod control;
+pub mod derp;
 pub mod disco;
 pub mod h2;
 pub mod identity;

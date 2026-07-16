@@ -159,6 +159,19 @@ impl NetworkMap {
             .is_some_and(|routes| routes.iter().any(|route| route.matches(address)))
     }
 
+    pub fn peer_for_destination(&self, address: IpAddr) -> Option<PublicKey<Node>> {
+        self.peer_routes
+            .iter()
+            .flat_map(|(key, routes)| {
+                routes
+                    .iter()
+                    .filter(|route| route.matches(address))
+                    .map(move |route| (*key, route.specificity()))
+            })
+            .max_by_key(|(key, specificity)| (*specificity, *key))
+            .map(|(key, _)| key)
+    }
+
     fn insert_peer(&mut self, peer: NodeInfo) {
         let key = peer.key;
         let routes = peer
@@ -296,6 +309,15 @@ impl IpPattern {
                 *family == address_family && address & mask == *network
             }
             Self::Invalid => false,
+        }
+    }
+
+    fn specificity(&self) -> u8 {
+        match self {
+            Self::Exact(IpAddr::V4(_)) => 32,
+            Self::Exact(IpAddr::V6(_)) => 128,
+            Self::Prefix { mask, .. } => mask.count_ones() as u8,
+            Self::Range { .. } | Self::Any | Self::Invalid => 0,
         }
     }
 }

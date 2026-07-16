@@ -20,6 +20,7 @@ pub mod netmap;
 pub mod noise;
 pub mod paths;
 mod resolver;
+pub mod runtime;
 pub mod stun;
 pub mod tailnet_lock;
 pub mod wireguard;

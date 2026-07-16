@@ -28,11 +28,15 @@ See the measured [footprint, memory, and idle-power optimizations](docs/optimiza
 - TS2021 Noise IK control-plane upgrade and EarlyNoise
 - bounded HTTP/2 framing and HPACK
 - interactive or auth-key registration and network-map decoding
+- resumable streaming maps and incremental peer/DERP updates
 - default-deny packet-filter evaluation
 - WireGuard IKpsk2 handshakes, transport encryption, and anti-replay window
-- authenticated DISCO ping/pong
+- authenticated DISCO ping/pong, CallMeMaybe, and endpoint selection
+- authenticated DERP v2 relay fallback for restrictive NATs
 - Tailscale-compatible STUN discovery
-- IPv4 UDP parsing and ICMP echo replies for small application data planes
+- transactional node-key rotation, including tailnet-lock re-signing
+- generic IPv4/IPv6 dispatch, UDP parsing, and ICMP/ICMPv6 echo replies
+- portable storage, clock, TCP, UDP, and optional packet-device traits
 
 All parsers have explicit size limits. Private keys do not implement `Debug`,
 and key material is zeroized when dropped.
@@ -44,11 +48,17 @@ The modules intentionally map to protocol boundaries:
 - `identity` and `key`: persistent node identity
 - `client`, `noise`, `h2`, and `control`: coordination server transport
 - `wireguard`: encrypted peer sessions
-- `disco` and `stun`: direct-path discovery
+- `disco`, `stun`, `paths`, and `derp`: direct and relayed paths
 - `netmap`: peers, AllowedIPs, and ACL checks
+- `runtime`: portable persistence, routing, retry, rotation, and packet-device APIs
 
 Applications supply sockets, persistent storage, scheduling, and packet
 dispatch. This keeps policy and hardware choices outside the protocol crate.
+
+The Wake-on-LAN firmware uses direct UDP when available and maintains an
+authenticated DERP connection as its hard-NAT fallback. It advertises its
+selected DERP region through control, processes CallMeMaybe messages, and
+reconnects resumable map streams when its endpoints change.
 
 ## How a new ESP32 joins a tailnet
 
@@ -103,6 +113,7 @@ Host-side validation:
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
+cargo test --test derp_live -- --ignored # requires internet + openssl
 cargo test --manifest-path examples/wake-on-lan/Cargo.toml \
   --target x86_64-unknown-linux-gnu
 ```

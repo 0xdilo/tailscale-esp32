@@ -16,6 +16,13 @@ ESP-IDF 5.4.3. The comparison uses the same application and dependency set.
 | `.flash.rodata` | 380,380 B | 279,428 B | -100,952 B (-26.5%) |
 | Explicit application task stacks | 98 KiB | 78 KiB | -20 KiB (-20.4%) |
 
+The completed relay/streaming runtime build measures 1,440,208 B as a
+flashable image (`.flash.text` 1,032,636 B and `.flash.rodata` 286,172 B).
+That is 59,024 B larger than the direct-only optimized build while remaining
+174,624 B smaller than the initial release. Its dedicated DERP/TLS task adds a
+40 KiB bounded stack; it is the reliability cost of accepting traffic when UDP
+is blocked or both peers are behind difficult NATs.
+
 Static DRAM remained approximately 39 KiB. Actual heap usage varies with the
 tailnet map, active WireGuard sessions, and ESP-IDF network buffers.
 
@@ -43,9 +50,9 @@ tailnet map, active WireGuard sessions, and ESP-IDF network buffers.
 - Wi-Fi modem sleep remains enabled; incoming traffic may wait for the next
   DTIM beacon. A 10-packet live ICMP test had no loss, with latency consistent
   with the access point's roughly 300 ms DTIM interval.
-- The control-plane TLS key is cached for six hours, and one Noise/HTTP2
-  connection is reused for periodic map polls. This removes a TLS key fetch,
-  Noise handshake, and registration request from every poll.
+- The control-plane TLS key is cached for six hours. A resumable Noise/HTTP2
+  map stream replaces periodic polls and only reconnects for endpoint changes,
+  outages, or server-directed closure.
 - STUN refresh remains at 20 seconds because reliable inbound reachability is
   more important than saving one small UDP packet on routers with short NAT
   timeouts.
@@ -71,5 +78,5 @@ point DTIM, signal strength, and traffic dominate wall-power measurements.
 
 Do not copy these settings blindly into a throughput-oriented VPN, camera, OTA
 downloader, or subnet router. Increase Wi-Fi buffers, stacks, and TCP windows
-when application traffic requires them. DERP and streaming maps remain more
-important reliability work than further byte-level optimization.
+when application traffic requires them. Applications that can guarantee easy
+direct UDP may omit the DERP task to recover its TLS stack and flash cost.

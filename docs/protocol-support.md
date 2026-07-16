@@ -10,19 +10,20 @@ not a general-purpose userspace network stack.
 | TS2021 Noise | Implemented | IK handshake, EarlyNoise, bounded records |
 | Control HTTP/2 | Implemented | Minimal client required for registration and map requests |
 | Registration | Implemented | Interactive follow-up and auth-key request support |
-| Network maps | Implemented | Full and delta decoding; reference app polls periodically |
+| Network maps | Implemented | Full, delta, resumable streaming, keepalive, and flow-control handling |
 | Packet filters | Implemented | Default deny; source, destination, protocol, and port checks |
 | WireGuard | Implemented | Responder/initiator, MAC1, TAI64N, counters, 128-packet replay window |
-| DISCO | Partial | Authenticated ping/pong |
+| DISCO | Implemented | Authenticated ping/pong, CallMeMaybe, and endpoint probing |
 | STUN | Implemented | Tailscale software attribute and fingerprint |
 | Direct UDP | Implemented | Depends on NAT behavior and peer reachability |
-| DERP | Not implemented | No relay fallback on blocked UDP or symmetric NAT |
-| Streaming maps | Not implemented | Polling nodes may appear offline in the admin console |
-| Endpoint migration | Partial | Reference app refreshes a stable public mapping |
-| Key rotation | Not implemented | Re-enrollment is currently required |
-| IPv4 application packets | Partial | UDP and ICMP echo parsing in the current API |
-| IPv6 application packets | Partial | UDP parsing only |
-| TUN interface | Out of scope | Applications dispatch packets directly |
+| DERP | Implemented | Authenticated v2 relay client; reference app accepts WireGuard over its home relay |
+| Streaming maps | Implemented | HTTP/2 streaming, deltas, resume handles, and endpoint-triggered reconnects |
+| Endpoint migration | Implemented | Authenticated probes, CallMeMaybe, direct-path expiry, and DERP fallback |
+| Key rotation | Implemented | Transactional persistence, old-key registration, and tailnet-lock re-signing |
+| IPv4 application packets | Implemented | Generic IP dispatch plus UDP and ICMP echo helpers |
+| IPv6 application packets | Implemented | Generic dispatch, extension headers, UDP, and ICMPv6 echo helpers |
+| TUN interface | Optional | Portable `PacketDevice` trait; direct dispatch remains cheaper on an ESP32 |
+| Runtime adapters | Implemented | Abstract identity storage, clock, TCP, UDP, and packet-device boundaries |
 
 ## Security invariants
 
@@ -34,11 +35,17 @@ not a general-purpose userspace network stack.
 - Add application authentication for high-impact actions, even inside a
   tailnet, when practical.
 
-## Roadmap
+## Deliberate non-goals
 
-1. Streaming network-map sessions and clean reconnect/resume behavior.
-2. DERP framing and authenticated relay sessions.
-3. CallMeMaybe, endpoint migration, and symmetric-NAT traversal.
-4. Node key rotation and long-duration outage recovery.
-5. A higher-level runner API over abstract storage, clock, TCP, and UDP traits.
-6. Endurance and interop testing against multiple Tailscale client versions.
+This crate is still not a replacement for `tailscaled`. It does not provide a
+general TCP/IP userspace stack, MagicDNS resolver, subnet or exit-node routing,
+Tailscale SSH, Taildrop, serve/funnel, peer API, posture reporting, or the full
+desktop configuration/state surface. The optional packet-device API is a
+boundary for an application-provided TUN implementation, not a bundled OS VPN
+driver.
+
+Long-running release qualification should include power-loss rotation tests,
+multi-day Wi-Fi outage recovery, changing NATs, and interoperability against
+the Tailscale versions used by a deployment. The repository includes a live,
+certificate-verified DERP smoke test, but it is opt-in because CI cannot assume
+internet access or the `openssl` command.

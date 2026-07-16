@@ -8,6 +8,14 @@ use embedded_svc::http::client::Client as HttpClient;
 use embedded_svc::http::Method;
 use embedded_svc::io::Write;
 use embedded_svc::wifi::{AuthMethod, ClientConfiguration, Configuration};
+use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::hal::peripherals::Peripherals;
+use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection};
+use esp_idf_svc::http::server::EspHttpServer;
+use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, EspNvsPartition, NvsDefault};
+use esp_idf_svc::sntp::{EspSntp, SyncStatus};
+use esp_idf_svc::wifi::{BlockingWifi, EspWifi};
+use log::{info, warn};
 use tailscale_esp32::client::ControlConnection;
 use tailscale_esp32::control::{
     ControlKeys, HostInfo, MapRequest, MapStreamDecoder, RegisterRequest, RegisterResponse,
@@ -17,20 +25,12 @@ use tailscale_esp32::disco::{open_ping, seal_pong};
 use tailscale_esp32::identity::{DeviceIdentity, ENCODED_IDENTITY_LEN};
 use tailscale_esp32::key::{Machine, Node};
 use tailscale_esp32::netmap::{
-    icmp_echo_reply, node_allows_source, parse_udp_packet, NetworkMap,
+    icmp_echo_reply_in_place, parse_udp_packet, NetworkMap,
 };
 use tailscale_esp32::stun::{binding_request, parse_binding_response};
 use tailscale_esp32::wireguard::{HandshakeResponder, WireGuardSession};
 use tailscale_esp32::CAPABILITY_VERSION;
 use tailscale_esp32_wake_example::{magic_packet, parse_mac, verify_wake_request};
-use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::hal::peripherals::Peripherals;
-use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection};
-use esp_idf_svc::http::server::EspHttpServer;
-use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, EspNvsPartition, NvsDefault};
-use esp_idf_svc::sntp::{EspSntp, SyncStatus};
-use esp_idf_svc::wifi::{BlockingWifi, EspWifi};
-use log::{info, warn};
 
 const WIFI_SSID: &str = env!("WIFI_SSID");
 const WIFI_PASS: &str = env!("WIFI_PASS");
@@ -38,23 +38,28 @@ const WAKE_TOKEN: &str = env!("WAKE_TOKEN");
 const WAKE_PATH: &str = env!("WAKE_PATH");
 const WAKE_MAC: &str = env!("WAKE_MAC");
 const TAILSCALE_HOSTNAME: &str = env!("TAILSCALE_HOSTNAME");
-const SERVER_STACK_SIZE: usize = 8192;
+const SERVER_STACK_SIZE: usize = 6144;
 const WAKE_REPETITIONS: usize = 3;
 const REPLAY_CACHE_SIZE: usize = 64;
+const NONCE_BYTES: usize = 16;
 const CONTROL_HOST: &str = "controlplane.tailscale.com";
 const CONTROL_KEY_URL: &str = "https://controlplane.tailscale.com/key?v=142";
-const TAILSCALE_CONTROL_STACK_SIZE: usize = 49_152;
-const TAILSCALE_DATA_STACK_SIZE: usize = 32_768;
+const TAILSCALE_CONTROL_STACK_SIZE: usize = 40_960;
+const TAILSCALE_DATA_STACK_SIZE: usize = 24_576;
 const TAILSCALE_WIREGUARD_PORT: u16 = 41_641;
 const TAILSCALE_WAKE_PORT: u16 = 41_642;
 const STUN_SERVER: &str = "derp1.tailscale.com:3478";
 const STUN_INTERVAL: Duration = Duration::from_secs(20);
+const CONTROL_MAP_INTERVAL: Duration = Duration::from_secs(60);
+const CONTROL_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+const CONTROL_KEY_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
 const PING_WAKE_COOLDOWN: Duration = Duration::from_secs(30);
 
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
     validate_configuration()?;
+    configure_power_management()?;
 
     let peripherals = Peripherals::take().context("peripherals already taken")?;
     let sys_loop = EspSystemEventLoop::take().context("system event loop unavailable")?;
@@ -76,6 +81,10 @@ fn main() -> Result<()> {
 
     let mut server = EspHttpServer::new(&esp_idf_svc::http::server::Configuration {
         stack_size: SERVER_STACK_SIZE,
+        max_sessions: 2,
+        max_open_sockets: 2,
+        max_uri_handlers: 2,
+        max_resp_headers: 4,
         ..Default::default()
     })?;
 
@@ -83,7 +92,7 @@ fn main() -> Result<()> {
         request.into_ok_response()?.write_all(b"ok\n").map(|_| ())
     })?;
 
-    let used_nonces = Arc::new(Mutex::new(VecDeque::<String>::new()));
+    let used_nonces = Arc::new(Mutex::new(VecDeque::<[u8; NONCE_BYTES]>::new()));
     server.fn_handler::<anyhow::Error, _>(WAKE_PATH, Method::Post, {
         let used_nonces = used_nonces.clone();
         move |request| {
@@ -108,19 +117,20 @@ fn main() -> Result<()> {
                     .write_all(b"unauthorized\n")?;
                 return Ok(());
             }
+            let nonce_key = decode_nonce(nonce).expect("verified nonce has valid hexadecimal data");
 
             {
                 let mut cache = used_nonces
                     .lock()
                     .map_err(|_| anyhow::anyhow!("replay cache lock poisoned"))?;
-                if cache.iter().any(|used| used == nonce) {
+                if cache.contains(&nonce_key) {
                     warn!("rejected replayed wake request");
                     request
                         .into_status_response(409)?
                         .write_all(b"replayed\n")?;
                     return Ok(());
                 }
-                cache.push_back(nonce.to_owned());
+                cache.push_back(nonce_key);
                 if cache.len() > REPLAY_CACHE_SIZE {
                     cache.pop_front();
                 }
@@ -165,8 +175,8 @@ fn main() -> Result<()> {
 }
 
 fn load_or_create_identity(partition: EspNvsPartition<NvsDefault>) -> Result<DeviceIdentity> {
-    let nvs = EspNvs::new(partition, "tailnode", true)
-        .context("could not open Tailscale NVS namespace")?;
+    let nvs =
+        EspNvs::new(partition, "tswake", true).context("could not open Tailscale NVS namespace")?;
     let mut encoded = [0_u8; ENCODED_IDENTITY_LEN];
     if let Some(stored) = nvs.get_blob("device", &mut encoded)? {
         let identity = DeviceIdentity::decode(stored).context("stored identity is invalid")?;
@@ -190,27 +200,41 @@ fn tailscale_control_loop(
     endpoints: Arc<Mutex<Vec<(String, u8)>>>,
 ) {
     let mut followup = None;
+    let mut cached_control_key = None;
+    let mut control_key_fetched_at = None;
     loop {
-        let delay = match tailscale_control_attempt(&keys, &mut followup, &network_map, &endpoints)
-        {
-            Ok(true) => Duration::from_secs(60),
-            Ok(false) => Duration::from_secs(15),
-            Err(error) => {
-                warn!("Tailscale control attempt failed: {error:#}");
-                Duration::from_secs(15)
+        let key_expired = control_key_fetched_at
+            .is_none_or(|fetched: Instant| fetched.elapsed() >= CONTROL_KEY_MAX_AGE);
+        if cached_control_key.is_none() || key_expired {
+            match fetch_control_key() {
+                Ok(key) => {
+                    cached_control_key = Some(key);
+                    control_key_fetched_at = Some(Instant::now());
+                }
+                Err(error) => {
+                    warn!("Tailscale control key refresh failed: {error:#}");
+                    std::thread::sleep(CONTROL_RETRY_INTERVAL);
+                    continue;
+                }
             }
-        };
-        std::thread::sleep(delay);
+        }
+        let control_key = cached_control_key.expect("control key initialized above");
+        if let Err(error) =
+            tailscale_control_session(&keys, control_key, &mut followup, &network_map, &endpoints)
+        {
+            warn!("Tailscale control session failed: {error:#}");
+        }
+        std::thread::sleep(CONTROL_RETRY_INTERVAL);
     }
 }
 
-fn tailscale_control_attempt(
+fn tailscale_control_session(
     keys: &DeviceIdentity,
+    control_key: tailscale_esp32::key::PublicKey<Machine>,
     followup: &mut Option<String>,
     network_map: &Mutex<NetworkMap>,
     endpoints: &Mutex<Vec<(String, u8)>>,
-) -> Result<bool> {
-    let control_key = fetch_control_key()?;
+) -> Result<()> {
     let stream =
         TcpStream::connect((CONTROL_HOST, 80)).context("could not connect to Tailscale control")?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
@@ -225,6 +249,7 @@ fn tailscale_control_attempt(
     .context("Tailscale control upgrade failed")?;
 
     let node_key = keys.node_key().public();
+    let load_balance_key = node_key.to_string();
     let mut registration = RegisterRequest::new(
         CAPABILITY_VERSION,
         node_key,
@@ -239,7 +264,7 @@ fn tailscale_control_attempt(
         .post_json_decode(
             "/machine/register",
             &registration,
-            &[node_key.to_string()],
+            &[load_balance_key.as_str()],
             64 * 1024,
         )
         .context("Tailscale registration failed")?;
@@ -258,10 +283,31 @@ fn tailscale_control_attempt(
             "TAILSCALE APPROVAL REQUIRED: {}",
             registration_response.auth_url
         );
-        return Ok(false);
+        return Ok(());
     }
     *followup = None;
 
+    loop {
+        update_network_map(
+            keys,
+            node_key,
+            &load_balance_key,
+            &mut control,
+            network_map,
+            endpoints,
+        )?;
+        std::thread::sleep(CONTROL_MAP_INTERVAL);
+    }
+}
+
+fn update_network_map(
+    keys: &DeviceIdentity,
+    node_key: tailscale_esp32::key::PublicKey<Node>,
+    load_balance_key: &str,
+    control: &mut ControlConnection<TcpStream>,
+    network_map: &Mutex<NetworkMap>,
+    endpoints: &Mutex<Vec<(String, u8)>>,
+) -> Result<()> {
     let mut map_request = MapRequest::new(
         CAPABILITY_VERSION,
         node_key,
@@ -280,7 +326,7 @@ fn tailscale_control_attempt(
         .post_json(
             "/machine/map",
             &map_request,
-            &[node_key.to_string()],
+            &[load_balance_key],
             1024 * 1024,
         )
         .context("Tailscale map request failed")?;
@@ -297,8 +343,8 @@ fn tailscale_control_attempt(
     let addresses = first
         .node
         .as_ref()
-        .map(|node| node.addresses.join(", "))
-        .unwrap_or_else(|| "unknown".into());
+        .and_then(|node| node.addresses.first())
+        .map_or("unknown", String::as_str);
     let peer_count = first.peers.as_ref().map_or(0, Vec::len);
     info!("Tailscale control ready: addresses={addresses}, peers={peer_count}");
     let mut current = network_map
@@ -307,7 +353,7 @@ fn tailscale_control_attempt(
     for map in maps {
         current.apply(map);
     }
-    Ok(true)
+    Ok(())
 }
 
 struct PeerSession {
@@ -315,11 +361,29 @@ struct PeerSession {
     peer_key: tailscale_esp32::key::PublicKey<Node>,
 }
 
+struct DataPlaneState {
+    sessions: BTreeMap<u32, PeerSession>,
+    last_ping_wake: Option<Instant>,
+    inner_packet: Vec<u8>,
+    outbound_packet: Vec<u8>,
+}
+
+impl DataPlaneState {
+    fn new(max_packet_len: usize) -> Self {
+        Self {
+            sessions: BTreeMap::new(),
+            last_ping_wake: None,
+            inner_packet: Vec::with_capacity(max_packet_len),
+            outbound_packet: Vec::with_capacity(max_packet_len),
+        }
+    }
+}
+
 fn tailscale_data_loop(
     keys: Arc<DeviceIdentity>,
     network_map: Arc<Mutex<NetworkMap>>,
     endpoints: Arc<Mutex<Vec<(String, u8)>>>,
-    used_nonces: Arc<Mutex<VecDeque<String>>>,
+    used_nonces: Arc<Mutex<VecDeque<[u8; NONCE_BYTES]>>>,
 ) {
     if let Err(error) = tailscale_data(keys, network_map, endpoints, used_nonces) {
         warn!("Tailscale data task stopped: {error:#}");
@@ -330,14 +394,13 @@ fn tailscale_data(
     keys: Arc<DeviceIdentity>,
     network_map: Arc<Mutex<NetworkMap>>,
     endpoints: Arc<Mutex<Vec<(String, u8)>>>,
-    used_nonces: Arc<Mutex<VecDeque<String>>>,
+    used_nonces: Arc<Mutex<VecDeque<[u8; NONCE_BYTES]>>>,
 ) -> Result<()> {
     let socket = UdpSocket::bind(("0.0.0.0", TAILSCALE_WIREGUARD_PORT))
         .context("could not bind Tailscale UDP socket")?;
-    let mut sessions = BTreeMap::<u32, PeerSession>::new();
-    let mut last_timestamps = BTreeMap::<String, [u8; 12]>::new();
-    let mut last_ping_wake = None;
+    let mut last_timestamps = BTreeMap::<tailscale_esp32::key::PublicKey<Node>, [u8; 12]>::new();
     let mut packet = [0_u8; 2048];
+    let mut state = DataPlaneState::new(packet.len());
     socket.set_read_timeout(Some(Duration::from_secs(2)))?;
     let stun_server = STUN_SERVER
         .to_socket_addrs()
@@ -404,7 +467,7 @@ fn tailscale_data(
                 &socket,
                 &keys,
                 &network_map,
-                &mut sessions,
+                &mut state.sessions,
                 &mut last_timestamps,
                 packet,
                 source,
@@ -413,8 +476,7 @@ fn tailscale_data(
                 &socket,
                 &network_map,
                 &used_nonces,
-                &mut sessions,
-                &mut last_ping_wake,
+                &mut state,
                 packet,
                 source,
             )?,
@@ -439,9 +501,7 @@ fn handle_disco(
     let allowed = network_map
         .lock()
         .map_err(|_| anyhow::anyhow!("network map lock poisoned"))?
-        .peers
-        .values()
-        .any(|peer| peer.key == node_key && peer.disco_key == ping.sender_disco_key);
+        .peer_matches_disco(node_key, ping.sender_disco_key);
     if !allowed {
         return Ok(());
     }
@@ -460,7 +520,7 @@ fn handle_wireguard_handshake(
     keys: &DeviceIdentity,
     network_map: &Mutex<NetworkMap>,
     sessions: &mut BTreeMap<u32, PeerSession>,
-    last_timestamps: &mut BTreeMap<String, [u8; 12]>,
+    last_timestamps: &mut BTreeMap<tailscale_esp32::key::PublicKey<Node>, [u8; 12]>,
     packet: &[u8],
     source: SocketAddr,
 ) -> Result<()> {
@@ -471,20 +531,17 @@ fn handle_wireguard_handshake(
     let peer_exists = network_map
         .lock()
         .map_err(|_| anyhow::anyhow!("network map lock poisoned"))?
-        .peers
-        .values()
-        .any(|peer| peer.key == response.remote_public);
+        .contains_peer(response.remote_public);
     if !peer_exists {
         return Ok(());
     }
-    let peer_id = response.remote_public.to_string();
     if last_timestamps
-        .get(&peer_id)
+        .get(&response.remote_public)
         .is_some_and(|last| *last >= response.timestamp)
     {
         return Ok(());
     }
-    last_timestamps.insert(peer_id, response.timestamp);
+    last_timestamps.insert(response.remote_public, response.timestamp);
     socket.send_to(&response.packet, source)?;
     sessions.insert(
         local_index,
@@ -506,9 +563,8 @@ fn handle_wireguard_handshake(
 fn handle_wireguard_transport(
     socket: &UdpSocket,
     network_map: &Mutex<NetworkMap>,
-    used_nonces: &Mutex<VecDeque<String>>,
-    sessions: &mut BTreeMap<u32, PeerSession>,
-    last_ping_wake: &mut Option<Instant>,
+    used_nonces: &Mutex<VecDeque<[u8; NONCE_BYTES]>>,
+    state: &mut DataPlaneState,
     packet: &[u8],
     source: SocketAddr,
 ) -> Result<()> {
@@ -516,40 +572,43 @@ fn handle_wireguard_transport(
         return Ok(());
     }
     let receiver = u32::from_le_bytes(packet[4..8].try_into().expect("length checked"));
-    let Some(peer_session) = sessions.get_mut(&receiver) else {
+    let Some(peer_session) = state.sessions.get_mut(&receiver) else {
         return Ok(());
     };
-    let Ok(inner) = peer_session.session.decrypt(packet) else {
+    if peer_session
+        .session
+        .decrypt_into(packet, &mut state.inner_packet)
+        .is_err()
+    {
         return Ok(());
-    };
-    if let Ok(echo) = icmp_echo_reply(&inner) {
+    }
+    if let Ok(echo) = icmp_echo_reply_in_place(&mut state.inner_packet) {
         let map = network_map
             .lock()
             .map_err(|_| anyhow::anyhow!("network map lock poisoned"))?;
-        let Some(peer) = map
-            .peers
-            .values()
-            .find(|peer| peer.key == peer_session.peer_key)
-        else {
-            return Ok(());
-        };
-        let route_allowed = node_allows_source(peer, echo.source);
+        let route_allowed = map.peer_allows_source(peer_session.peer_key, echo.source);
         let acl_allowed = map.allows(echo.source, echo.destination, 1, 0);
         drop(map);
         if !route_allowed || !acl_allowed {
             return Ok(());
         }
 
-        let response = peer_session.session.encrypt(&echo.packet)?;
-        socket.send_to(&response, source)?;
-        if last_ping_wake.is_none_or(|last| last.elapsed() >= PING_WAKE_COOLDOWN) {
+        peer_session.session.encrypt_into(
+            &state.inner_packet[..echo.packet_len],
+            &mut state.outbound_packet,
+        )?;
+        socket.send_to(&state.outbound_packet, source)?;
+        if state
+            .last_ping_wake
+            .is_none_or(|last| last.elapsed() >= PING_WAKE_COOLDOWN)
+        {
             send_magic_packet(WAKE_MAC)?;
-            *last_ping_wake = Some(Instant::now());
+            state.last_ping_wake = Some(Instant::now());
             info!("accepted authenticated Tailscale ping wake request");
         }
         return Ok(());
     }
-    let Ok(udp) = parse_udp_packet(&inner) else {
+    let Ok(udp) = parse_udp_packet(&state.inner_packet) else {
         return Ok(());
     };
     if udp.destination_port != TAILSCALE_WAKE_PORT {
@@ -559,14 +618,7 @@ fn handle_wireguard_transport(
     let map = network_map
         .lock()
         .map_err(|_| anyhow::anyhow!("network map lock poisoned"))?;
-    let Some(peer) = map
-        .peers
-        .values()
-        .find(|peer| peer.key == peer_session.peer_key)
-    else {
-        return Ok(());
-    };
-    let route_allowed = node_allows_source(peer, udp.source);
+    let route_allowed = map.peer_allows_source(peer_session.peer_key, udp.source);
     let acl_allowed = map.allows(udp.source, udp.destination, 17, udp.destination_port);
     if !route_allowed || !acl_allowed {
         return Ok(());
@@ -595,13 +647,14 @@ fn handle_wireguard_transport(
     if !auth_valid {
         return Ok(());
     }
+    let nonce_key = decode_nonce(nonce).expect("verified nonce has valid hexadecimal data");
     let mut cache = used_nonces
         .lock()
         .map_err(|_| anyhow::anyhow!("replay cache lock poisoned"))?;
-    if cache.iter().any(|used| used == nonce) {
+    if cache.contains(&nonce_key) {
         return Ok(());
     }
-    cache.push_back(nonce.to_owned());
+    cache.push_back(nonce_key);
     if cache.len() > REPLAY_CACHE_SIZE {
         cache.pop_front();
     }
@@ -620,6 +673,26 @@ fn random_session_index(sessions: &BTreeMap<u32, PeerSession>) -> Result<u32> {
         if index != 0 && !sessions.contains_key(&index) {
             return Ok(index);
         }
+    }
+}
+
+fn decode_nonce(value: &str) -> Option<[u8; NONCE_BYTES]> {
+    if value.len() != NONCE_BYTES * 2 {
+        return None;
+    }
+    let mut decoded = [0_u8; NONCE_BYTES];
+    for (output, pair) in decoded.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        *output = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Some(decoded)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -686,6 +759,23 @@ fn validate_configuration() -> Result<()> {
         bail!("WAKE_PATH must be a slash followed by at least 16 safe characters");
     }
     parse_mac(WAKE_MAC).map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
+fn configure_power_management() -> Result<()> {
+    let configuration = esp_idf_svc::sys::esp_pm_config_t {
+        max_freq_mhz: 160,
+        min_freq_mhz: 40,
+        light_sleep_enable: true,
+    };
+    let result = unsafe {
+        esp_idf_svc::sys::esp_pm_configure(
+            std::ptr::from_ref(&configuration).cast::<std::ffi::c_void>(),
+        )
+    };
+    if result != esp_idf_svc::sys::ESP_OK {
+        bail!("power-management configuration failed with ESP-IDF error {result}");
+    }
     Ok(())
 }
 

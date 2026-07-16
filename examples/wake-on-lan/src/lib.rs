@@ -76,7 +76,7 @@ pub fn verify_wake_request(
 }
 
 fn canonical_request(path: &str, timestamp: u64, nonce: &str) -> String {
-    format!("tailscale-esp32-wake-v1\n{timestamp}\n{nonce}\nPOST\n{path}")
+    format!("esp32wake-v1\n{timestamp}\n{nonce}\nPOST\n{path}")
 }
 
 fn decode_signature(value: &str) -> Result<[u8; 32], AuthError> {

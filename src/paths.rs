@@ -59,12 +59,12 @@ impl EndpointTracker {
             present.insert(peer.key);
             let paths = self.peers.entry(peer.key).or_insert_with(|| PeerPaths {
                 disco_key: peer.disco_key,
-                home_derp: peer.home_derp,
+                home_derp: peer.home_derp_region(),
                 candidates: BTreeMap::new(),
                 outstanding: BTreeMap::new(),
             });
             paths.disco_key = peer.disco_key;
-            paths.home_derp = peer.home_derp;
+            paths.home_derp = peer.home_derp_region();
             for endpoint in peer.endpoints.iter().filter_map(|value| value.parse().ok()) {
                 paths.candidates.entry(endpoint).or_insert(Candidate {
                     source: CandidateSource::Control,
@@ -281,6 +281,7 @@ mod tests {
             allowed_ips: None,
             endpoints: vec!["192.0.2.1:41641".into()],
             home_derp: 4,
+            legacy_derp: String::new(),
             online: Some(true),
             machine_authorized: true,
         }

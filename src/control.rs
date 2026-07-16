@@ -49,6 +49,16 @@ pub struct HostInfo {
     pub no_logs_no_support: bool,
     #[serde(rename = "Userspace")]
     pub userspace: bool,
+    #[serde(rename = "NetInfo", skip_serializing_if = "Option::is_none")]
+    pub net_info: Option<NetworkInfo>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct NetworkInfo {
+    #[serde(rename = "PreferredDERP")]
+    pub preferred_derp: u16,
+    #[serde(rename = "LinkType")]
+    pub link_type: String,
 }
 
 impl HostInfo {
@@ -64,7 +74,18 @@ impl HostInfo {
             architecture: "xtensa".into(),
             no_logs_no_support: true,
             userspace: true,
+            net_info: None,
         }
+    }
+
+    pub fn with_preferred_derp(mut self, region: u16) -> Self {
+        if region != 0 {
+            self.net_info = Some(NetworkInfo {
+                preferred_derp: region,
+                link_type: "wifi".into(),
+            });
+        }
+        self
     }
 }
 
@@ -179,7 +200,9 @@ mod base64_bytes {
     where
         D: Deserializer<'de>,
     {
-        let encoded = String::deserialize(deserializer)?;
+        let Some(encoded) = Option::<String>::deserialize(deserializer)? else {
+            return Ok(Vec::new());
+        };
         base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .map_err(serde::de::Error::custom)
@@ -274,10 +297,24 @@ pub struct NodeInfo {
     pub endpoints: Vec<String>,
     #[serde(rename = "HomeDERP", default)]
     pub home_derp: u16,
+    #[serde(rename = "DERP", default)]
+    pub legacy_derp: String,
     #[serde(rename = "Online", default)]
     pub online: Option<bool>,
     #[serde(rename = "MachineAuthorized", default)]
     pub machine_authorized: bool,
+}
+
+impl NodeInfo {
+    pub fn home_derp_region(&self) -> u16 {
+        if self.home_derp != 0 {
+            return self.home_derp;
+        }
+        self.legacy_derp
+            .rsplit_once(':')
+            .and_then(|(_, region)| region.parse().ok())
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -514,6 +551,9 @@ mod tests {
             serde_json::from_str(r#"{"MachineAuthorized":true,"NodeKeySignature":"AQID"}"#)
                 .unwrap();
         assert_eq!(response.node_key_signature, [1, 2, 3]);
+        let response: RegisterResponse =
+            serde_json::from_str(r#"{"MachineAuthorized":true,"NodeKeySignature":null}"#).unwrap();
+        assert!(response.node_key_signature.is_empty());
     }
 
     #[test]

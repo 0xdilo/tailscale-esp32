@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -15,6 +16,7 @@ use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConne
 use esp_idf_svc::http::server::EspHttpServer;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, EspNvsPartition, NvsDefault};
 use esp_idf_svc::sntp::{EspSntp, SyncStatus};
+use esp_idf_svc::tls::{Config as TlsConfiguration, EspTls, InternalSocket};
 use esp_idf_svc::wifi::{BlockingWifi, EspWifi};
 use log::{info, warn};
 use tailscale_esp32::client::ControlConnection;
@@ -22,13 +24,12 @@ use tailscale_esp32::control::{
     ControlKeys, HostInfo, MapRequest, MapStreamDecoder, RegisterRequest, RegisterResponse,
     ENDPOINT_TYPE_LOCAL, ENDPOINT_TYPE_PORTMAPPED,
 };
-use tailscale_esp32::disco::{open_ping, seal_pong};
+use tailscale_esp32::derp::{DerpClient, Event as DerpEvent};
+use tailscale_esp32::disco::{open_call_me_maybe, open_ping, seal_ping, seal_pong};
 use tailscale_esp32::h2::StreamEvent;
 use tailscale_esp32::identity::{DeviceIdentity, ENCODED_IDENTITY_LEN};
 use tailscale_esp32::key::{Machine, Node};
-use tailscale_esp32::netmap::{
-    icmp_echo_reply_in_place, parse_udp_packet, NetworkMap,
-};
+use tailscale_esp32::netmap::{icmp_echo_reply_in_place, parse_udp_packet, NetworkMap};
 use tailscale_esp32::stun::{binding_request, parse_binding_response};
 use tailscale_esp32::wireguard::{HandshakeResponder, WireGuardSession};
 use tailscale_esp32::CAPABILITY_VERSION;
@@ -48,6 +49,7 @@ const CONTROL_HOST: &str = "controlplane.tailscale.com";
 const CONTROL_KEY_URL: &str = "https://controlplane.tailscale.com/key?v=142";
 const TAILSCALE_CONTROL_STACK_SIZE: usize = 40_960;
 const TAILSCALE_DATA_STACK_SIZE: usize = 24_576;
+const TAILSCALE_DERP_STACK_SIZE: usize = 40_960;
 const TAILSCALE_WIREGUARD_PORT: u16 = 41_641;
 const TAILSCALE_WAKE_PORT: u16 = 41_642;
 const STUN_SERVER: &str = "derp1.tailscale.com:3478";
@@ -152,6 +154,8 @@ fn main() -> Result<()> {
             let local_endpoint = format!("{}:{TAILSCALE_WIREGUARD_PORT}", ip_info.ip);
             let endpoints = Arc::new(Mutex::new(vec![(local_endpoint, ENDPOINT_TYPE_LOCAL)]));
             let endpoint_generation = Arc::new(AtomicU32::new(0));
+            let preferred_derp = Arc::new(AtomicU16::new(0));
+            let (probe_sender, probe_receiver) = sync_channel(8);
             std::thread::Builder::new()
                 .name("tailscale-control".into())
                 .stack_size(TAILSCALE_CONTROL_STACK_SIZE)
@@ -160,12 +164,14 @@ fn main() -> Result<()> {
                     let network_map = network_map.clone();
                     let endpoints = endpoints.clone();
                     let endpoint_generation = endpoint_generation.clone();
+                    let preferred_derp = preferred_derp.clone();
                     move || {
                         tailscale_control_loop(
                             keys,
                             network_map,
                             endpoints,
                             endpoint_generation,
+                            preferred_derp,
                         )
                     }
                 })
@@ -173,16 +179,37 @@ fn main() -> Result<()> {
             std::thread::Builder::new()
                 .name("tailscale-data".into())
                 .stack_size(TAILSCALE_DATA_STACK_SIZE)
+                .spawn({
+                    let keys = keys.clone();
+                    let network_map = network_map.clone();
+                    let used_nonces = used_nonces.clone();
+                    let endpoint_generation = endpoint_generation.clone();
+                    move || {
+                        tailscale_data_loop(
+                            keys,
+                            network_map,
+                            endpoints,
+                            endpoint_generation,
+                            probe_receiver,
+                            used_nonces,
+                        )
+                    }
+                })
+                .context("could not start Tailscale data task")?;
+            std::thread::Builder::new()
+                .name("tailscale-derp".into())
+                .stack_size(TAILSCALE_DERP_STACK_SIZE)
                 .spawn(move || {
-                    tailscale_data_loop(
+                    tailscale_derp_loop(
                         keys,
                         network_map,
-                        endpoints,
                         endpoint_generation,
+                        preferred_derp,
+                        probe_sender,
                         used_nonces,
                     )
                 })
-                .context("could not start Tailscale data task")?;
+                .context("could not start Tailscale DERP task")?;
         }
         Err(error) => warn!("Tailscale identity unavailable: {error:#}"),
     }
@@ -208,8 +235,9 @@ fn load_or_create_identity(partition: EspNvsPartition<NvsDefault>) -> Result<Dev
     Ok(identity)
 }
 
-fn host_info(keys: &DeviceIdentity) -> HostInfo {
+fn host_info(keys: &DeviceIdentity, preferred_derp: u16) -> HostInfo {
     HostInfo::esp32(TAILSCALE_HOSTNAME, hex(keys.backend_log_id()))
+        .with_preferred_derp(preferred_derp)
 }
 
 fn tailscale_control_loop(
@@ -217,6 +245,7 @@ fn tailscale_control_loop(
     network_map: Arc<Mutex<NetworkMap>>,
     endpoints: Arc<Mutex<Vec<(String, u8)>>>,
     endpoint_generation: Arc<AtomicU32>,
+    preferred_derp: Arc<AtomicU16>,
 ) {
     let mut followup = None;
     let mut cached_control_key = None;
@@ -239,17 +268,16 @@ fn tailscale_control_loop(
             }
         }
         let control_key = cached_control_key.expect("control key initialized above");
-        if let Err(error) =
-            tailscale_control_session(
-                &keys,
-                control_key,
-                &mut followup,
-                &network_map,
-                &endpoints,
-                &endpoint_generation,
-                &mut map_resume,
-            )
-        {
+        if let Err(error) = tailscale_control_session(
+            &keys,
+            control_key,
+            &mut followup,
+            &network_map,
+            &endpoints,
+            &endpoint_generation,
+            &preferred_derp,
+            &mut map_resume,
+        ) {
             warn!("Tailscale control session failed: {error:#}");
         }
         std::thread::sleep(CONTROL_RETRY_INTERVAL);
@@ -263,6 +291,7 @@ fn tailscale_control_session(
     network_map: &Mutex<NetworkMap>,
     endpoints: &Mutex<Vec<(String, u8)>>,
     endpoint_generation: &AtomicU32,
+    preferred_derp: &AtomicU16,
     map_resume: &mut MapResume,
 ) -> Result<()> {
     let stream =
@@ -284,7 +313,7 @@ fn tailscale_control_session(
         CAPABILITY_VERSION,
         node_key,
         keys.network_lock_key().public(),
-        host_info(keys),
+        host_info(keys, preferred_derp.load(Ordering::Acquire)),
     );
     if let Some(url) = followup.as_ref() {
         info!("waiting for Tailscale approval at: {url}");
@@ -325,6 +354,7 @@ fn tailscale_control_session(
         &mut control,
         network_map,
         endpoints,
+        preferred_derp,
     )?;
     stream_network_maps(
         keys,
@@ -333,6 +363,7 @@ fn tailscale_control_session(
         &mut control,
         network_map,
         endpoint_generation,
+        preferred_derp,
         advertised_generation,
         map_resume,
     )
@@ -351,6 +382,7 @@ fn stream_network_maps(
     control: &mut ControlConnection<TcpStream>,
     network_map: &Mutex<NetworkMap>,
     endpoint_generation: &AtomicU32,
+    preferred_derp: &AtomicU16,
     advertised_generation: u32,
     resume: &mut MapResume,
 ) -> Result<()> {
@@ -358,7 +390,7 @@ fn stream_network_maps(
         CAPABILITY_VERSION,
         node_key,
         keys.disco_key().public(),
-        host_info(keys),
+        host_info(keys, preferred_derp.load(Ordering::Acquire)),
     )
     .streaming()
     .resume(resume.handle.clone(), resume.sequence);
@@ -373,9 +405,7 @@ fn stream_network_maps(
             .context("streaming Tailscale map failed")?
         {
             StreamEvent::Headers {
-                status,
-                end_stream,
-                ..
+                status, end_stream, ..
             } => {
                 if status != 200 {
                     bail!("streaming Tailscale map returned HTTP {status}");
@@ -426,12 +456,13 @@ fn update_network_map(
     control: &mut ControlConnection<TcpStream>,
     network_map: &Mutex<NetworkMap>,
     endpoints: &Mutex<Vec<(String, u8)>>,
+    preferred_derp: &AtomicU16,
 ) -> Result<()> {
     let mut map_request = MapRequest::new(
         CAPABILITY_VERSION,
         node_key,
         keys.disco_key().public(),
-        host_info(keys),
+        host_info(keys, preferred_derp.load(Ordering::Acquire)),
     );
     let endpoints = endpoints
         .lock()
@@ -487,6 +518,12 @@ struct DataPlaneState {
     outbound_packet: Vec<u8>,
 }
 
+struct DirectProbe {
+    peer: tailscale_esp32::key::PublicKey<Node>,
+    disco_key: tailscale_esp32::key::PublicKey<tailscale_esp32::key::Disco>,
+    endpoints: Vec<SocketAddr>,
+}
+
 impl DataPlaneState {
     fn new(max_packet_len: usize) -> Self {
         Self {
@@ -498,21 +535,211 @@ impl DataPlaneState {
     }
 }
 
+struct StdTls(EspTls<InternalSocket>);
+
+impl std::io::Read for StdTls {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.0
+            .read(buffer)
+            .map_err(|error| std::io::Error::other(error.to_string()))
+    }
+}
+
+impl std::io::Write for StdTls {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .write(buffer)
+            .map_err(|error| std::io::Error::other(error.to_string()))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn tailscale_derp_loop(
+    keys: Arc<DeviceIdentity>,
+    network_map: Arc<Mutex<NetworkMap>>,
+    endpoint_generation: Arc<AtomicU32>,
+    preferred_derp: Arc<AtomicU16>,
+    probe_sender: SyncSender<DirectProbe>,
+    used_nonces: Arc<Mutex<VecDeque<[u8; NONCE_BYTES]>>>,
+) {
+    loop {
+        if let Err(error) = tailscale_derp_session(
+            &keys,
+            &network_map,
+            &endpoint_generation,
+            &preferred_derp,
+            &probe_sender,
+            &used_nonces,
+        ) {
+            warn!("Tailscale DERP session failed: {error:#}");
+        }
+        std::thread::sleep(CONTROL_RETRY_INTERVAL);
+    }
+}
+
+fn tailscale_derp_session(
+    keys: &DeviceIdentity,
+    network_map: &Mutex<NetworkMap>,
+    endpoint_generation: &AtomicU32,
+    preferred_derp: &AtomicU16,
+    probe_sender: &SyncSender<DirectProbe>,
+    used_nonces: &Mutex<VecDeque<[u8; NONCE_BYTES]>>,
+) -> Result<()> {
+    let (region_id, derp_node) = {
+        let map = network_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("network map lock poisoned"))?;
+        let (region_id, node) = map
+            .preferred_derp_node()
+            .context("Tailscale map does not have a usable DERP node yet")?;
+        (region_id, node.clone())
+    };
+    if preferred_derp.swap(region_id, Ordering::AcqRel) != region_id {
+        endpoint_generation.fetch_add(1, Ordering::Release);
+    }
+    let certificate_name = if derp_node.cert_name.is_empty() {
+        derp_node.host_name.as_str()
+    } else {
+        derp_node.cert_name.as_str()
+    };
+    let mut tls = EspTls::new().context("could not initialize DERP TLS")?;
+    tls.connect(
+        &derp_node.host_name,
+        derp_node.relay_port(),
+        &TlsConfiguration {
+            common_name: Some(certificate_name),
+            timeout_ms: 130_000,
+            use_crt_bundle_attach: true,
+            ..Default::default()
+        },
+    )
+    .with_context(|| format!("could not connect to DERP node {}", derp_node.name))?;
+    let mut derp = DerpClient::connect(StdTls(tls), &derp_node.host_name, keys.node_key().clone())
+        .context("DERP authentication failed")?;
+    if !matches!(derp.receive()?, DerpEvent::ServerInfo(_)) {
+        bail!("DERP server did not send its authenticated server information");
+    }
+    derp.note_preferred(true)?;
+    info!(
+        "Tailscale DERP connected: {} (region {region_id})",
+        derp_node.name
+    );
+
+    let mut last_timestamps = BTreeMap::<tailscale_esp32::key::PublicKey<Node>, [u8; 12]>::new();
+    let mut state = DataPlaneState::new(2048);
+    loop {
+        let DerpEvent::Packet { source, payload } = derp.receive()? else {
+            continue;
+        };
+        if payload.len() < 4 {
+            continue;
+        }
+        if payload.starts_with(b"TS\xf0\x9f\x92\xac") {
+            let Ok(message) = open_call_me_maybe(keys.disco_key(), &payload) else {
+                continue;
+            };
+            let trusted = network_map
+                .lock()
+                .map_err(|_| anyhow::anyhow!("network map lock poisoned"))?
+                .peer_matches_disco(source, message.sender_disco_key);
+            if trusted {
+                let _ = probe_sender.try_send(DirectProbe {
+                    peer: source,
+                    disco_key: message.sender_disco_key,
+                    endpoints: message.endpoints,
+                });
+            }
+            continue;
+        }
+        match u32::from_le_bytes(payload[..4].try_into().expect("length checked")) {
+            1 => handle_derp_wireguard_handshake(
+                &mut derp,
+                keys,
+                network_map,
+                &mut state.sessions,
+                &mut last_timestamps,
+                source,
+                &payload,
+            )?,
+            4 => {
+                if process_wireguard_transport(network_map, used_nonces, &mut state, &payload)? {
+                    derp.send(source, &state.outbound_packet)?;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn handle_derp_wireguard_handshake<S: std::io::Read + std::io::Write>(
+    derp: &mut DerpClient<S>,
+    keys: &DeviceIdentity,
+    network_map: &Mutex<NetworkMap>,
+    sessions: &mut BTreeMap<u32, PeerSession>,
+    last_timestamps: &mut BTreeMap<tailscale_esp32::key::PublicKey<Node>, [u8; 12]>,
+    derp_source: tailscale_esp32::key::PublicKey<Node>,
+    packet: &[u8],
+) -> Result<()> {
+    let local_index = random_session_index(sessions)?;
+    let Ok(response) = HandshakeResponder::respond(keys.node_key(), packet, local_index) else {
+        return Ok(());
+    };
+    if response.remote_public != derp_source {
+        return Ok(());
+    }
+    let peer_exists = network_map
+        .lock()
+        .map_err(|_| anyhow::anyhow!("network map lock poisoned"))?
+        .contains_peer(response.remote_public);
+    if !peer_exists
+        || last_timestamps
+            .get(&response.remote_public)
+            .is_some_and(|last| *last >= response.timestamp)
+    {
+        return Ok(());
+    }
+    last_timestamps.insert(response.remote_public, response.timestamp);
+    derp.send(derp_source, &response.packet)?;
+    sessions.insert(
+        local_index,
+        PeerSession {
+            session: response.session,
+            peer_key: response.remote_public,
+        },
+    );
+    while sessions.len() > 16 {
+        let Some(oldest) = sessions.keys().next().copied() else {
+            break;
+        };
+        sessions.remove(&oldest);
+    }
+    info!("Tailscale WireGuard session established over DERP");
+    Ok(())
+}
+
 fn tailscale_data_loop(
     keys: Arc<DeviceIdentity>,
     network_map: Arc<Mutex<NetworkMap>>,
     endpoints: Arc<Mutex<Vec<(String, u8)>>>,
     endpoint_generation: Arc<AtomicU32>,
+    probe_receiver: Receiver<DirectProbe>,
     used_nonces: Arc<Mutex<VecDeque<[u8; NONCE_BYTES]>>>,
 ) {
-    if let Err(error) = tailscale_data(
-        keys,
-        network_map,
-        endpoints,
-        endpoint_generation,
-        used_nonces,
-    ) {
-        warn!("Tailscale data task stopped: {error:#}");
+    loop {
+        if let Err(error) = tailscale_data(
+            keys.clone(),
+            network_map.clone(),
+            endpoints.clone(),
+            endpoint_generation.clone(),
+            &probe_receiver,
+            used_nonces.clone(),
+        ) {
+            warn!("Tailscale data session failed: {error:#}");
+        }
+        std::thread::sleep(CONTROL_RETRY_INTERVAL);
     }
 }
 
@@ -521,6 +748,7 @@ fn tailscale_data(
     network_map: Arc<Mutex<NetworkMap>>,
     endpoints: Arc<Mutex<Vec<(String, u8)>>>,
     endpoint_generation: Arc<AtomicU32>,
+    probe_receiver: &Receiver<DirectProbe>,
     used_nonces: Arc<Mutex<VecDeque<[u8; NONCE_BYTES]>>>,
 ) -> Result<()> {
     let socket = UdpSocket::bind(("0.0.0.0", TAILSCALE_WIREGUARD_PORT))
@@ -541,6 +769,25 @@ fn tailscale_data(
     info!("Tailscale data plane listening on UDP {TAILSCALE_WIREGUARD_PORT}");
 
     loop {
+        while let Ok(probe) = probe_receiver.try_recv() {
+            for destination in probe.endpoints {
+                let mut transaction_id = [0_u8; 12];
+                getrandom::getrandom(&mut transaction_id)
+                    .map_err(|error| anyhow::anyhow!("DISCO transaction RNG failed: {error}"))?;
+                let packet = seal_ping(
+                    keys.disco_key(),
+                    probe.disco_key,
+                    transaction_id,
+                    keys.node_key().public(),
+                )?;
+                if destination.is_ipv4() {
+                    if let Err(error) = socket.send_to(&packet, destination) {
+                        warn!("could not send direct-path probe to {destination}: {error}");
+                    }
+                }
+            }
+            info!("sent direct-path probes requested by {}", probe.peer);
+        }
         if last_stun.elapsed() >= STUN_INTERVAL {
             getrandom::getrandom(&mut stun_transaction)
                 .map_err(|error| anyhow::anyhow!("STUN transaction RNG failed: {error}"))?;
@@ -600,14 +847,11 @@ fn tailscale_data(
                 packet,
                 source,
             )?,
-            4 => handle_wireguard_transport(
-                &socket,
-                &network_map,
-                &used_nonces,
-                &mut state,
-                packet,
-                source,
-            )?,
+            4 => {
+                if process_wireguard_transport(&network_map, &used_nonces, &mut state, packet)? {
+                    socket.send_to(&state.outbound_packet, source)?;
+                }
+            }
             _ => {}
         }
     }
@@ -688,27 +932,25 @@ fn handle_wireguard_handshake(
     Ok(())
 }
 
-fn handle_wireguard_transport(
-    socket: &UdpSocket,
+fn process_wireguard_transport(
     network_map: &Mutex<NetworkMap>,
     used_nonces: &Mutex<VecDeque<[u8; NONCE_BYTES]>>,
     state: &mut DataPlaneState,
     packet: &[u8],
-    source: SocketAddr,
-) -> Result<()> {
+) -> Result<bool> {
     if packet.len() < 8 {
-        return Ok(());
+        return Ok(false);
     }
     let receiver = u32::from_le_bytes(packet[4..8].try_into().expect("length checked"));
     let Some(peer_session) = state.sessions.get_mut(&receiver) else {
-        return Ok(());
+        return Ok(false);
     };
     if peer_session
         .session
         .decrypt_into(packet, &mut state.inner_packet)
         .is_err()
     {
-        return Ok(());
+        return Ok(false);
     }
     if let Ok(echo) = icmp_echo_reply_in_place(&mut state.inner_packet) {
         let map = network_map
@@ -718,14 +960,13 @@ fn handle_wireguard_transport(
         let acl_allowed = map.allows(echo.source, echo.destination, 1, 0);
         drop(map);
         if !route_allowed || !acl_allowed {
-            return Ok(());
+            return Ok(false);
         }
 
         peer_session.session.encrypt_into(
             &state.inner_packet[..echo.packet_len],
             &mut state.outbound_packet,
         )?;
-        socket.send_to(&state.outbound_packet, source)?;
         if state
             .last_ping_wake
             .is_none_or(|last| last.elapsed() >= PING_WAKE_COOLDOWN)
@@ -734,13 +975,13 @@ fn handle_wireguard_transport(
             state.last_ping_wake = Some(Instant::now());
             info!("accepted authenticated Tailscale ping wake request");
         }
-        return Ok(());
+        return Ok(true);
     }
     let Ok(udp) = parse_udp_packet(&state.inner_packet) else {
-        return Ok(());
+        return Ok(false);
     };
     if udp.destination_port != TAILSCALE_WAKE_PORT {
-        return Ok(());
+        return Ok(false);
     }
 
     let map = network_map
@@ -749,18 +990,18 @@ fn handle_wireguard_transport(
     let route_allowed = map.peer_allows_source(peer_session.peer_key, udp.source);
     let acl_allowed = map.allows(udp.source, udp.destination, 17, udp.destination_port);
     if !route_allowed || !acl_allowed {
-        return Ok(());
+        return Ok(false);
     }
     drop(map);
 
     let Ok(auth) = std::str::from_utf8(udp.payload) else {
-        return Ok(());
+        return Ok(false);
     };
     let mut fields = auth.lines();
     let (Some(timestamp), Some(nonce), Some(signature)) =
         (fields.next(), fields.next(), fields.next())
     else {
-        return Ok(());
+        return Ok(false);
     };
     let auth_valid = fields.next().is_none()
         && verify_wake_request(
@@ -773,14 +1014,14 @@ fn handle_wireguard_transport(
         )
         .is_ok();
     if !auth_valid {
-        return Ok(());
+        return Ok(false);
     }
     let nonce_key = decode_nonce(nonce).expect("verified nonce has valid hexadecimal data");
     let mut cache = used_nonces
         .lock()
         .map_err(|_| anyhow::anyhow!("replay cache lock poisoned"))?;
     if cache.contains(&nonce_key) {
-        return Ok(());
+        return Ok(false);
     }
     cache.push_back(nonce_key);
     if cache.len() > REPLAY_CACHE_SIZE {
@@ -789,7 +1030,7 @@ fn handle_wireguard_transport(
     drop(cache);
     send_magic_packet(WAKE_MAC)?;
     info!("accepted authenticated Tailscale wake request");
-    Ok(())
+    Ok(false)
 }
 
 fn random_session_index(sessions: &BTreeMap<u32, PeerSession>) -> Result<u32> {

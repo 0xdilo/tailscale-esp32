@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use thiserror::Error;
 
-use super::control::{DerpMap, FilterRule, MapResponse, NodeInfo};
+use super::control::{DerpMap, DerpNode, FilterRule, MapResponse, NodeInfo};
 use super::key::{Disco, Node, PublicKey};
 
 const TCP: u8 = 6;
@@ -151,6 +151,35 @@ impl NetworkMap {
 
     pub fn derp_map(&self) -> Option<&DerpMap> {
         self.derp_map.as_ref()
+    }
+
+    pub fn home_derp_node(&self) -> Option<&DerpNode> {
+        self.preferred_derp_node().map(|(_, node)| node)
+    }
+
+    pub fn preferred_derp_node(&self) -> Option<(u16, &DerpNode)> {
+        let map = self.derp_map.as_ref()?;
+        let requested = self
+            .self_node
+            .as_ref()
+            .map(NodeInfo::home_derp_region)
+            .unwrap_or(0);
+        if requested != 0 {
+            if let Some(node) = map
+                .regions
+                .get(&requested)
+                .and_then(|region| region.nodes.iter().find(|node| !node.stun_only))
+            {
+                return Some((requested, node));
+            }
+        }
+        map.regions.iter().find_map(|(region_id, region)| {
+            region
+                .nodes
+                .iter()
+                .find(|node| !node.stun_only)
+                .map(|node| (*region_id, node))
+        })
     }
 
     pub fn peer_allows_source(&self, key: PublicKey<Node>, address: IpAddr) -> bool {
@@ -768,6 +797,7 @@ mod tests {
             allowed_ips: Some(allowed_ips.iter().map(|value| (*value).into()).collect()),
             endpoints: Vec::new(),
             home_derp: 1,
+            legacy_derp: String::new(),
             online: Some(true),
             machine_authorized: true,
         }

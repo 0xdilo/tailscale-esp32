@@ -380,6 +380,29 @@ pub struct UdpPacket<'a> {
     pub payload: &'a [u8],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IpPacket<'a> {
+    pub source: IpAddr,
+    pub destination: IpAddr,
+    pub protocol: u8,
+    pub fragmented: bool,
+    pub transport_offset: usize,
+    pub packet: &'a [u8],
+    pub payload: &'a [u8],
+}
+
+impl IpPacket<'_> {
+    pub fn transport_ports(&self) -> Option<(u16, u16)> {
+        if self.fragmented || !matches!(self.protocol, TCP | UDP) || self.payload.len() < 4 {
+            return None;
+        }
+        Some((
+            u16::from_be_bytes(self.payload[..2].try_into().expect("length checked")),
+            u16::from_be_bytes(self.payload[2..4].try_into().expect("length checked")),
+        ))
+    }
+}
+
 pub struct IcmpEchoReply {
     pub source: IpAddr,
     pub destination: IpAddr,
@@ -405,8 +428,16 @@ pub fn icmp_echo_reply(packet: &[u8]) -> Result<IcmpEchoReply, PacketError> {
 }
 
 pub fn icmp_echo_reply_in_place(packet: &mut [u8]) -> Result<IcmpEchoMeta, PacketError> {
-    if packet.len() < 28 || packet[0] >> 4 != 4 {
-        return Err(PacketError::UnsupportedIpVersion);
+    match packet.first().ok_or(PacketError::Truncated)? >> 4 {
+        4 => icmp_v4_echo_reply_in_place(packet),
+        6 => icmp_v6_echo_reply_in_place(packet),
+        _ => Err(PacketError::UnsupportedIpVersion),
+    }
+}
+
+fn icmp_v4_echo_reply_in_place(packet: &mut [u8]) -> Result<IcmpEchoMeta, PacketError> {
+    if packet.len() < 28 {
+        return Err(PacketError::Truncated);
     }
     let header_len = (packet[0] as usize & 0x0f) * 4;
     let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
@@ -442,6 +473,127 @@ pub fn icmp_echo_reply_in_place(packet: &mut [u8]) -> Result<IcmpEchoMeta, Packe
         source,
         destination,
         packet_len: total_len,
+    })
+}
+
+fn icmp_v6_echo_reply_in_place(packet: &mut [u8]) -> Result<IcmpEchoMeta, PacketError> {
+    let parsed = parse_ip_packet(packet)?;
+    let source = parsed.source;
+    let destination = parsed.destination;
+    let protocol = parsed.protocol;
+    let fragmented = parsed.fragmented;
+    let offset = parsed.transport_offset;
+    let total_len = parsed.packet.len();
+    if protocol != ICMP_V6
+        || fragmented
+        || parsed.payload.len() < 8
+        || parsed.payload[0] != 128
+        || parsed.payload[1] != 0
+    {
+        return Err(PacketError::UnsupportedTransport);
+    }
+    packet[8..40].rotate_left(16);
+    packet[7] = 64;
+    packet[offset] = 129;
+    packet[offset + 2..offset + 4].fill(0);
+    let checksum = icmp_v6_checksum(&packet[8..24], &packet[24..40], &packet[offset..total_len]);
+    packet[offset + 2..offset + 4].copy_from_slice(&checksum.to_be_bytes());
+    Ok(IcmpEchoMeta {
+        source,
+        destination,
+        packet_len: total_len,
+    })
+}
+
+pub fn parse_ip_packet(packet: &[u8]) -> Result<IpPacket<'_>, PacketError> {
+    match packet.first().ok_or(PacketError::Truncated)? >> 4 {
+        4 => parse_ip_v4(packet),
+        6 => parse_ip_v6(packet),
+        _ => Err(PacketError::UnsupportedIpVersion),
+    }
+}
+
+fn parse_ip_v4(packet: &[u8]) -> Result<IpPacket<'_>, PacketError> {
+    if packet.len() < 20 {
+        return Err(PacketError::Truncated);
+    }
+    let header_len = (packet[0] as usize & 0x0f) * 4;
+    let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    if header_len < 20 || total_len < header_len || packet.len() < total_len {
+        return Err(PacketError::Truncated);
+    }
+    let fragment = u16::from_be_bytes([packet[6], packet[7]]);
+    let source = IpAddr::V4(Ipv4Addr::from(
+        <[u8; 4]>::try_from(&packet[12..16]).expect("fixed-length slice"),
+    ));
+    let destination = IpAddr::V4(Ipv4Addr::from(
+        <[u8; 4]>::try_from(&packet[16..20]).expect("fixed-length slice"),
+    ));
+    Ok(IpPacket {
+        source,
+        destination,
+        protocol: packet[9],
+        fragmented: fragment & 0x3fff != 0,
+        transport_offset: header_len,
+        packet: &packet[..total_len],
+        payload: &packet[header_len..total_len],
+    })
+}
+
+fn parse_ip_v6(packet: &[u8]) -> Result<IpPacket<'_>, PacketError> {
+    if packet.len() < 40 {
+        return Err(PacketError::Truncated);
+    }
+    let total_len = 40 + u16::from_be_bytes([packet[4], packet[5]]) as usize;
+    if packet.len() < total_len {
+        return Err(PacketError::Truncated);
+    }
+    let source = IpAddr::V6(Ipv6Addr::from(
+        <[u8; 16]>::try_from(&packet[8..24]).expect("fixed-length slice"),
+    ));
+    let destination = IpAddr::V6(Ipv6Addr::from(
+        <[u8; 16]>::try_from(&packet[24..40]).expect("fixed-length slice"),
+    ));
+    let mut protocol = packet[6];
+    let mut offset = 40;
+    let mut fragmented = false;
+    loop {
+        let extension_len = match protocol {
+            0 | 43 | 60 => {
+                if offset + 2 > total_len {
+                    return Err(PacketError::Truncated);
+                }
+                (packet[offset + 1] as usize + 1) * 8
+            }
+            44 => {
+                if offset + 8 > total_len {
+                    return Err(PacketError::Truncated);
+                }
+                fragmented = true;
+                8
+            }
+            51 => {
+                if offset + 2 > total_len {
+                    return Err(PacketError::Truncated);
+                }
+                (packet[offset + 1] as usize + 2) * 4
+            }
+            _ => break,
+        };
+        if extension_len == 0 || offset + extension_len > total_len {
+            return Err(PacketError::Truncated);
+        }
+        protocol = packet[offset];
+        offset += extension_len;
+    }
+    Ok(IpPacket {
+        source,
+        destination,
+        protocol,
+        fragmented,
+        transport_offset: offset,
+        packet: &packet[..total_len],
+        payload: &packet[offset..total_len],
     })
 }
 
@@ -485,20 +637,17 @@ fn parse_udp_v4(packet: &[u8]) -> Result<UdpPacket<'_>, PacketError> {
 }
 
 fn parse_udp_v6(packet: &[u8]) -> Result<UdpPacket<'_>, PacketError> {
-    if packet.len() < 48 {
-        return Err(PacketError::Truncated);
-    }
-    let total_len = 40 + u16::from_be_bytes([packet[4], packet[5]]) as usize;
-    if packet[6] != UDP || packet.len() < total_len || total_len < 48 {
+    let parsed = parse_ip_v6(packet)?;
+    if parsed.protocol != UDP || parsed.fragmented || parsed.payload.len() < 8 {
         return Err(PacketError::UnsupportedTransport);
     }
-    let source = IpAddr::V6(Ipv6Addr::from(
-        <[u8; 16]>::try_from(&packet[8..24]).expect("fixed-length slice"),
-    ));
-    let destination = IpAddr::V6(Ipv6Addr::from(
-        <[u8; 16]>::try_from(&packet[24..40]).expect("fixed-length slice"),
-    ));
-    parse_udp_payload(packet, 40, total_len, source, destination)
+    parse_udp_payload(
+        parsed.packet,
+        parsed.transport_offset,
+        parsed.packet.len(),
+        parsed.source,
+        parsed.destination,
+    )
 }
 
 fn parse_udp_payload(
@@ -523,12 +672,28 @@ fn parse_udp_payload(
 }
 
 fn internet_checksum(bytes: &[u8]) -> u16 {
-    let mut sum = bytes.chunks_exact(2).fold(0_u32, |sum, word| {
+    finish_checksum(checksum_sum(0, bytes))
+}
+
+fn icmp_v6_checksum(source: &[u8], destination: &[u8], icmp: &[u8]) -> u16 {
+    let mut sum = checksum_sum(0, source);
+    sum = checksum_sum(sum, destination);
+    sum = checksum_sum(sum, &(icmp.len() as u32).to_be_bytes());
+    sum = checksum_sum(sum, &[0, 0, 0, ICMP_V6]);
+    finish_checksum(checksum_sum(sum, icmp))
+}
+
+fn checksum_sum(initial: u32, bytes: &[u8]) -> u32 {
+    let mut sum = bytes.chunks_exact(2).fold(initial, |sum, word| {
         sum + u16::from_be_bytes([word[0], word[1]]) as u32
     });
     if let Some(byte) = bytes.chunks_exact(2).remainder().first() {
         sum += (*byte as u32) << 8;
     }
+    sum
+}
+
+fn finish_checksum(mut sum: u32) -> u16 {
     while sum > u16::MAX as u32 {
         sum = (sum & u16::MAX as u32) + (sum >> 16);
     }
@@ -541,7 +706,8 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{
-        icmp_echo_reply, icmp_echo_reply_in_place, internet_checksum, parse_udp_packet, NetworkMap,
+        icmp_echo_reply, icmp_echo_reply_in_place, internet_checksum, parse_ip_packet,
+        parse_udp_packet, NetworkMap,
     };
     use crate::control::{FilterRule, MapResponse, NetPortRange, NodeInfo, PeerChange, PortRange};
     use crate::key::{Disco, Machine, Node, PublicKey};
@@ -711,6 +877,66 @@ mod tests {
         assert_eq!(parsed.source_port, 1234);
         assert_eq!(parsed.destination_port, 41642);
         assert_eq!(parsed.payload, b"wake");
+    }
+
+    #[test]
+    fn parses_arbitrary_ipv4_and_ipv6_extension_header_packets() {
+        let mut ipv4 = vec![0_u8; 40];
+        ipv4[0] = 0x45;
+        ipv4[2..4].copy_from_slice(&40_u16.to_be_bytes());
+        ipv4[9] = 6;
+        ipv4[12..16].copy_from_slice(&[100, 64, 0, 1]);
+        ipv4[16..20].copy_from_slice(&[100, 64, 0, 2]);
+        ipv4[20..22].copy_from_slice(&1234_u16.to_be_bytes());
+        ipv4[22..24].copy_from_slice(&443_u16.to_be_bytes());
+        let parsed = parse_ip_packet(&ipv4).unwrap();
+        assert_eq!(parsed.protocol, 6);
+        assert_eq!(parsed.transport_ports(), Some((1234, 443)));
+
+        let mut ipv6 = vec![0_u8; 56];
+        ipv6[0] = 0x60;
+        ipv6[4..6].copy_from_slice(&16_u16.to_be_bytes());
+        ipv6[6] = 60;
+        ipv6[7] = 64;
+        ipv6[8..24].copy_from_slice(&Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped().octets());
+        ipv6[24..40].copy_from_slice(&Ipv4Addr::new(192, 0, 2, 2).to_ipv6_mapped().octets());
+        ipv6[40] = 17;
+        ipv6[41] = 0;
+        ipv6[48..50].copy_from_slice(&41641_u16.to_be_bytes());
+        ipv6[50..52].copy_from_slice(&41642_u16.to_be_bytes());
+        ipv6[52..54].copy_from_slice(&8_u16.to_be_bytes());
+        let parsed = parse_ip_packet(&ipv6).unwrap();
+        assert_eq!(parsed.protocol, 17);
+        assert_eq!(parsed.transport_offset, 48);
+        assert_eq!(parsed.transport_ports(), Some((41641, 41642)));
+        assert_eq!(parse_udp_packet(&ipv6).unwrap().destination_port, 41642);
+    }
+
+    #[test]
+    fn creates_ipv6_icmp_echo_reply_in_place() {
+        let source = "fd7a:115c:a1e0::1".parse::<std::net::Ipv6Addr>().unwrap();
+        let destination = "fd7a:115c:a1e0::2".parse::<std::net::Ipv6Addr>().unwrap();
+        let mut packet = vec![0_u8; 48];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&8_u16.to_be_bytes());
+        packet[6] = 58;
+        packet[7] = 32;
+        packet[8..24].copy_from_slice(&source.octets());
+        packet[24..40].copy_from_slice(&destination.octets());
+        packet[40] = 128;
+        packet[44..48].copy_from_slice(&[0x12, 0x34, 0, 1]);
+
+        let meta = icmp_echo_reply_in_place(&mut packet).unwrap();
+        assert_eq!(meta.source, IpAddr::V6(source));
+        assert_eq!(meta.destination, IpAddr::V6(destination));
+        assert_eq!(packet[7], 64);
+        assert_eq!(&packet[8..24], &destination.octets());
+        assert_eq!(&packet[24..40], &source.octets());
+        assert_eq!(packet[40], 129);
+        assert_eq!(
+            super::icmp_v6_checksum(&packet[8..24], &packet[24..40], &packet[40..]),
+            0
+        );
     }
 
     #[test]

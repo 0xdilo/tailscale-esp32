@@ -21,6 +21,7 @@ pub mod noise;
 pub mod paths;
 mod resolver;
 pub mod stun;
+pub mod tailnet_lock;
 pub mod wireguard;
 
 /// Tailscale protocol capability implemented by this release.

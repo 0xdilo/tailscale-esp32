@@ -100,6 +100,13 @@ pub struct RegisterRequest {
     followup: String,
     #[serde(rename = "Ephemeral", skip_serializing_if = "std::ops::Not::not")]
     pub ephemeral: bool,
+    #[serde(
+        rename = "NodeKeySignature",
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "base64_bytes"
+    )]
+    node_key_signature: Vec<u8>,
 }
 
 impl RegisterRequest {
@@ -118,6 +125,7 @@ impl RegisterRequest {
             host_info,
             followup: String::new(),
             ephemeral: false,
+            node_key_signature: Vec::new(),
         }
     }
 
@@ -128,6 +136,16 @@ impl RegisterRequest {
 
     pub fn with_followup(mut self, followup: impl Into<String>) -> Self {
         self.followup = followup.into();
+        self
+    }
+
+    pub fn rotating_from(mut self, old_node_key: PublicKey<Node>) -> Self {
+        self.old_node_key = old_node_key;
+        self
+    }
+
+    pub fn with_node_key_signature(mut self, signature: Vec<u8>) -> Self {
+        self.node_key_signature = signature;
         self
     }
 }
@@ -142,6 +160,30 @@ pub struct RegisterResponse {
     pub auth_url: String,
     #[serde(rename = "Error", default)]
     pub error: String,
+    #[serde(rename = "NodeKeySignature", default, with = "base64_bytes")]
+    pub node_key_signature: Vec<u8>,
+}
+
+mod base64_bytes {
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -451,6 +493,27 @@ mod tests {
         assert!(value["NLKey"].as_str().unwrap().starts_with("nlpub:"));
         assert_eq!(value["Auth"]["AuthKey"], "secret");
         assert_eq!(value["Hostinfo"]["DeviceModel"], "ESP32-S3");
+    }
+
+    #[test]
+    fn rotation_registration_uses_old_key_and_base64_signature() {
+        let old_key = PublicKey::<Node>::from_bytes([3; 32]);
+        let request = RegisterRequest::new(
+            142,
+            PublicKey::<Node>::from_bytes([4; 32]),
+            PublicKey::<NetworkLock>::from_bytes([2; 32]),
+            HostInfo::esp32("esp32-wake", "backend"),
+        )
+        .rotating_from(old_key)
+        .with_node_key_signature(vec![1, 2, 3]);
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["OldNodeKey"], old_key.to_string());
+        assert_eq!(value["NodeKeySignature"], "AQID");
+
+        let response: RegisterResponse =
+            serde_json::from_str(r#"{"MachineAuthorized":true,"NodeKeySignature":"AQID"}"#)
+                .unwrap();
+        assert_eq!(response.node_key_signature, [1, 2, 3]);
     }
 
     #[test]

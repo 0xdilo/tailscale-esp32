@@ -1,7 +1,7 @@
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::key::{Disco, Machine, NetworkLockPrivateKey, Node, PrivateKey};
+use crate::key::{Disco, Machine, NetworkLockPrivateKey, Node, PrivateKey, PublicKey};
 
 const FORMAT_VERSION: u8 = 1;
 const KEY_LEN: usize = 32;
@@ -21,6 +21,23 @@ pub struct DeviceIdentity {
     disco: PrivateKey<Disco>,
     network_lock: NetworkLockPrivateKey,
     backend_log_id: [u8; KEY_LEN],
+}
+
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct NodeKeyRotation {
+    #[zeroize(skip)]
+    old_public: PublicKey<Node>,
+    replacement: PrivateKey<Node>,
+}
+
+impl NodeKeyRotation {
+    pub fn old_public(&self) -> PublicKey<Node> {
+        self.old_public
+    }
+
+    pub fn replacement(&self) -> &PrivateKey<Node> {
+        &self.replacement
+    }
 }
 
 impl DeviceIdentity {
@@ -81,6 +98,28 @@ impl DeviceIdentity {
         &self.backend_log_id
     }
 
+    /// Generates a replacement node key without changing the active identity.
+    /// Persist the value returned by [`Self::rotated`] before using it for data
+    /// traffic, so a power loss cannot leave control and flash out of sync.
+    pub fn prepare_node_key_rotation(&self) -> Result<NodeKeyRotation, IdentityError> {
+        let mut bytes = [0_u8; KEY_LEN];
+        getrandom::getrandom(&mut bytes)?;
+        Ok(NodeKeyRotation {
+            old_public: self.node.public(),
+            replacement: PrivateKey::from_bytes(bytes),
+        })
+    }
+
+    /// Returns a copy with an accepted replacement node key installed.
+    pub fn rotated(&self, rotation: &NodeKeyRotation) -> Result<Self, IdentityError> {
+        if rotation.old_public != self.node.public() {
+            return Err(IdentityError::StaleRotation);
+        }
+        let mut identity = self.clone();
+        identity.node = rotation.replacement.clone();
+        Ok(identity)
+    }
+
     fn from_key_material(material: [u8; KEY_LEN * KEY_COUNT]) -> Self {
         let key = |index: usize| {
             material[index * KEY_LEN..(index + 1) * KEY_LEN]
@@ -105,6 +144,8 @@ pub enum IdentityError {
     InvalidLength(usize),
     #[error("identity format version {0} is unsupported")]
     UnsupportedVersion(u8),
+    #[error("node-key rotation was prepared for a different active key")]
+    StaleRotation,
 }
 
 #[cfg(test)]
@@ -136,5 +177,26 @@ mod tests {
             DeviceIdentity::decode(&encoded),
             Err(IdentityError::UnsupportedVersion(9))
         ));
+    }
+
+    #[test]
+    fn node_key_rotation_is_transactional_and_persistent() {
+        let identity = DeviceIdentity::generate().unwrap();
+        let old_key = identity.node_key().public();
+        let rotation = identity.prepare_node_key_rotation().unwrap();
+        assert_eq!(identity.node_key().public(), old_key);
+        assert_eq!(rotation.old_public(), old_key);
+        assert_ne!(rotation.replacement().public(), old_key);
+
+        let rotated = identity.rotated(&rotation).unwrap();
+        let restored = DeviceIdentity::decode(&rotated.encode()).unwrap();
+        assert_eq!(
+            restored.node_key().public(),
+            rotation.replacement().public()
+        );
+        assert_eq!(
+            restored.machine_key().public(),
+            identity.machine_key().public()
+        );
     }
 }

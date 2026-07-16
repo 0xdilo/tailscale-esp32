@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::marker::PhantomData;
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -98,6 +98,10 @@ impl NetworkLockPrivateKey {
 
     pub fn as_seed(&self) -> &[u8; 32] {
         &self.seed
+    }
+
+    pub(crate) fn sign(&self, message: &[u8]) -> [u8; 64] {
+        SigningKey::from_bytes(&self.seed).sign(message).to_bytes()
     }
 }
 

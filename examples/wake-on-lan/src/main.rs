@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -22,6 +23,7 @@ use tailscale_esp32::control::{
     ENDPOINT_TYPE_LOCAL, ENDPOINT_TYPE_PORTMAPPED,
 };
 use tailscale_esp32::disco::{open_ping, seal_pong};
+use tailscale_esp32::h2::StreamEvent;
 use tailscale_esp32::identity::{DeviceIdentity, ENCODED_IDENTITY_LEN};
 use tailscale_esp32::key::{Machine, Node};
 use tailscale_esp32::netmap::{
@@ -50,7 +52,6 @@ const TAILSCALE_WIREGUARD_PORT: u16 = 41_641;
 const TAILSCALE_WAKE_PORT: u16 = 41_642;
 const STUN_SERVER: &str = "derp1.tailscale.com:3478";
 const STUN_INTERVAL: Duration = Duration::from_secs(20);
-const CONTROL_MAP_INTERVAL: Duration = Duration::from_secs(60);
 const CONTROL_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const CONTROL_KEY_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
 const PING_WAKE_COOLDOWN: Duration = Duration::from_secs(30);
@@ -150,6 +151,7 @@ fn main() -> Result<()> {
             let network_map = Arc::new(Mutex::new(NetworkMap::default()));
             let local_endpoint = format!("{}:{TAILSCALE_WIREGUARD_PORT}", ip_info.ip);
             let endpoints = Arc::new(Mutex::new(vec![(local_endpoint, ENDPOINT_TYPE_LOCAL)]));
+            let endpoint_generation = Arc::new(AtomicU32::new(0));
             std::thread::Builder::new()
                 .name("tailscale-control".into())
                 .stack_size(TAILSCALE_CONTROL_STACK_SIZE)
@@ -157,13 +159,29 @@ fn main() -> Result<()> {
                     let keys = keys.clone();
                     let network_map = network_map.clone();
                     let endpoints = endpoints.clone();
-                    move || tailscale_control_loop(keys, network_map, endpoints)
+                    let endpoint_generation = endpoint_generation.clone();
+                    move || {
+                        tailscale_control_loop(
+                            keys,
+                            network_map,
+                            endpoints,
+                            endpoint_generation,
+                        )
+                    }
                 })
                 .context("could not start Tailscale control task")?;
             std::thread::Builder::new()
                 .name("tailscale-data".into())
                 .stack_size(TAILSCALE_DATA_STACK_SIZE)
-                .spawn(move || tailscale_data_loop(keys, network_map, endpoints, used_nonces))
+                .spawn(move || {
+                    tailscale_data_loop(
+                        keys,
+                        network_map,
+                        endpoints,
+                        endpoint_generation,
+                        used_nonces,
+                    )
+                })
                 .context("could not start Tailscale data task")?;
         }
         Err(error) => warn!("Tailscale identity unavailable: {error:#}"),
@@ -198,10 +216,12 @@ fn tailscale_control_loop(
     keys: Arc<DeviceIdentity>,
     network_map: Arc<Mutex<NetworkMap>>,
     endpoints: Arc<Mutex<Vec<(String, u8)>>>,
+    endpoint_generation: Arc<AtomicU32>,
 ) {
     let mut followup = None;
     let mut cached_control_key = None;
     let mut control_key_fetched_at = None;
+    let mut map_resume = MapResume::default();
     loop {
         let key_expired = control_key_fetched_at
             .is_none_or(|fetched: Instant| fetched.elapsed() >= CONTROL_KEY_MAX_AGE);
@@ -220,7 +240,15 @@ fn tailscale_control_loop(
         }
         let control_key = cached_control_key.expect("control key initialized above");
         if let Err(error) =
-            tailscale_control_session(&keys, control_key, &mut followup, &network_map, &endpoints)
+            tailscale_control_session(
+                &keys,
+                control_key,
+                &mut followup,
+                &network_map,
+                &endpoints,
+                &endpoint_generation,
+                &mut map_resume,
+            )
         {
             warn!("Tailscale control session failed: {error:#}");
         }
@@ -234,10 +262,12 @@ fn tailscale_control_session(
     followup: &mut Option<String>,
     network_map: &Mutex<NetworkMap>,
     endpoints: &Mutex<Vec<(String, u8)>>,
+    endpoint_generation: &AtomicU32,
+    map_resume: &mut MapResume,
 ) -> Result<()> {
     let stream =
         TcpStream::connect((CONTROL_HOST, 80)).context("could not connect to Tailscale control")?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(130)))?;
     stream.set_write_timeout(Some(Duration::from_secs(15)))?;
     let mut control = ControlConnection::upgrade(
         stream,
@@ -287,16 +317,105 @@ fn tailscale_control_session(
     }
     *followup = None;
 
+    let advertised_generation = endpoint_generation.load(Ordering::Acquire);
+    update_network_map(
+        keys,
+        node_key,
+        &load_balance_key,
+        &mut control,
+        network_map,
+        endpoints,
+    )?;
+    stream_network_maps(
+        keys,
+        node_key,
+        &load_balance_key,
+        &mut control,
+        network_map,
+        endpoint_generation,
+        advertised_generation,
+        map_resume,
+    )
+}
+
+#[derive(Default)]
+struct MapResume {
+    handle: String,
+    sequence: i64,
+}
+
+fn stream_network_maps(
+    keys: &DeviceIdentity,
+    node_key: tailscale_esp32::key::PublicKey<Node>,
+    load_balance_key: &str,
+    control: &mut ControlConnection<TcpStream>,
+    network_map: &Mutex<NetworkMap>,
+    endpoint_generation: &AtomicU32,
+    advertised_generation: u32,
+    resume: &mut MapResume,
+) -> Result<()> {
+    let request = MapRequest::new(
+        CAPABILITY_VERSION,
+        node_key,
+        keys.disco_key().public(),
+        host_info(keys),
+    )
+    .streaming()
+    .resume(resume.handle.clone(), resume.sequence);
+    let mut stream = control
+        .start_json_stream("/machine/map", &request, &[load_balance_key])
+        .context("could not start streaming Tailscale map")?;
+    let mut decoder = MapStreamDecoder::new(1024 * 1024);
+    let mut headers_received = false;
     loop {
-        update_network_map(
-            keys,
-            node_key,
-            &load_balance_key,
-            &mut control,
-            network_map,
-            endpoints,
-        )?;
-        std::thread::sleep(CONTROL_MAP_INTERVAL);
+        match control
+            .read_stream_event(&mut stream)
+            .context("streaming Tailscale map failed")?
+        {
+            StreamEvent::Headers {
+                status,
+                end_stream,
+                ..
+            } => {
+                if status != 200 {
+                    bail!("streaming Tailscale map returned HTTP {status}");
+                }
+                if end_stream {
+                    bail!("streaming Tailscale map ended before sending data");
+                }
+                headers_received = true;
+            }
+            StreamEvent::Data {
+                payload,
+                end_stream,
+            } => {
+                if !headers_received {
+                    bail!("streaming Tailscale map sent data before HTTP headers");
+                }
+                let maps = decoder
+                    .push(&payload)
+                    .context("could not decode streaming Tailscale map")?;
+                let mut current = network_map
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("network map lock poisoned"))?;
+                for map in maps {
+                    if !map.map_session_handle.is_empty() {
+                        resume.handle.clone_from(&map.map_session_handle);
+                    }
+                    if map.sequence > 0 {
+                        resume.sequence = map.sequence;
+                    }
+                    current.apply(map);
+                }
+                drop(current);
+                if endpoint_generation.load(Ordering::Acquire) != advertised_generation {
+                    bail!("Tailscale endpoints changed; reconnecting the map stream");
+                }
+                if end_stream {
+                    bail!("streaming Tailscale map ended");
+                }
+            }
+        }
     }
 }
 
@@ -383,9 +502,16 @@ fn tailscale_data_loop(
     keys: Arc<DeviceIdentity>,
     network_map: Arc<Mutex<NetworkMap>>,
     endpoints: Arc<Mutex<Vec<(String, u8)>>>,
+    endpoint_generation: Arc<AtomicU32>,
     used_nonces: Arc<Mutex<VecDeque<[u8; NONCE_BYTES]>>>,
 ) {
-    if let Err(error) = tailscale_data(keys, network_map, endpoints, used_nonces) {
+    if let Err(error) = tailscale_data(
+        keys,
+        network_map,
+        endpoints,
+        endpoint_generation,
+        used_nonces,
+    ) {
         warn!("Tailscale data task stopped: {error:#}");
     }
 }
@@ -394,6 +520,7 @@ fn tailscale_data(
     keys: Arc<DeviceIdentity>,
     network_map: Arc<Mutex<NetworkMap>>,
     endpoints: Arc<Mutex<Vec<(String, u8)>>>,
+    endpoint_generation: Arc<AtomicU32>,
     used_nonces: Arc<Mutex<VecDeque<[u8; NONCE_BYTES]>>>,
 ) -> Result<()> {
     let socket = UdpSocket::bind(("0.0.0.0", TAILSCALE_WIREGUARD_PORT))
@@ -450,6 +577,7 @@ fn tailscale_data(
                 // control because full Tailscale exchanges them over DERP.
                 current.push((public_endpoint.clone(), ENDPOINT_TYPE_PORTMAPPED));
                 if changed {
+                    endpoint_generation.fetch_add(1, Ordering::Release);
                     info!("Tailscale STUN endpoint discovered: {public_endpoint}");
                 }
                 continue;

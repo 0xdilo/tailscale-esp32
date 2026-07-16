@@ -5,11 +5,12 @@ use blake2::digest::{KeyInit as BlakeKeyInit, Mac};
 use blake2::{Blake2s256, Blake2sMac, Digest};
 use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{ChaCha20Poly1305, Nonce, Tag};
-use snow::{Builder, HandshakeState};
+use snow::HandshakeState;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::key::{Node, PrivateKey, PublicKey};
+use super::resolver::noise_builder;
 
 const NOISE_PATTERN: &str = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
 const PROLOGUE: &[u8] = b"WireGuard v1 zx2c4 Jason@zx2c4.com";
@@ -69,7 +70,7 @@ impl HandshakeResponder {
 
         let params = NOISE_PATTERN.parse()?;
         let psk = [0_u8; 32];
-        let mut builder = Builder::new(params)
+        let mut builder = noise_builder(params)
             .prologue(PROLOGUE)
             .local_private_key(local_private.as_bytes())
             .psk(2, &psk);
@@ -151,7 +152,7 @@ impl HandshakeInitiator {
         }
         let params = NOISE_PATTERN.parse()?;
         let psk = [0_u8; 32];
-        let mut builder = Builder::new(params)
+        let mut builder = noise_builder(params)
             .prologue(PROLOGUE)
             .local_private_key(local_private.as_bytes())
             .remote_public_key(remote_public.as_bytes())
@@ -242,11 +243,22 @@ pub struct WireGuardSession {
 
 impl WireGuardSession {
     pub fn encrypt(&mut self, packet: &[u8]) -> Result<Vec<u8>, WireGuardError> {
+        let mut message = Vec::new();
+        self.encrypt_into(packet, &mut message)?;
+        Ok(message)
+    }
+
+    pub fn encrypt_into(
+        &mut self,
+        packet: &[u8],
+        message: &mut Vec<u8>,
+    ) -> Result<(), WireGuardError> {
         if self.send_counter >= MAX_COUNTER {
             return Err(WireGuardError::CounterExhausted);
         }
         let padded_len = packet.len().div_ceil(16) * 16;
-        let mut message = Vec::with_capacity(16 + padded_len + 16);
+        message.clear();
+        message.reserve(16 + padded_len + 16);
         message.extend_from_slice(&TRANSPORT_TYPE.to_le_bytes());
         message.extend_from_slice(&self.remote_index.to_le_bytes());
         message.extend_from_slice(&self.send_counter.to_le_bytes());
@@ -258,10 +270,20 @@ impl WireGuardSession {
             .map_err(|_| WireGuardError::TransportCrypto)?;
         message.extend_from_slice(&tag);
         self.send_counter += 1;
-        Ok(message)
+        Ok(())
     }
 
     pub fn decrypt(&mut self, message: &[u8]) -> Result<Vec<u8>, WireGuardError> {
+        let mut plaintext = Vec::new();
+        self.decrypt_into(message, &mut plaintext)?;
+        Ok(plaintext)
+    }
+
+    pub fn decrypt_into(
+        &mut self,
+        message: &[u8],
+        plaintext: &mut Vec<u8>,
+    ) -> Result<(), WireGuardError> {
         if message.len() < 32 {
             return Err(WireGuardError::InvalidMessageLength(message.len()));
         }
@@ -277,14 +299,15 @@ impl WireGuardSession {
             return Err(WireGuardError::Replay);
         }
         let tag_start = message.len() - 16;
-        let mut plaintext = message[16..tag_start].to_vec();
+        plaintext.clear();
+        plaintext.extend_from_slice(&message[16..tag_start]);
         let tag = Tag::clone_from_slice(&message[tag_start..]);
         let cipher = ChaCha20Poly1305::new((&self.receive_key).into());
         cipher
-            .decrypt_in_place_detached(&transport_nonce(counter), &[], &mut plaintext, &tag)
+            .decrypt_in_place_detached(&transport_nonce(counter), &[], plaintext, &tag)
             .map_err(|_| WireGuardError::TransportCrypto)?;
         self.replay.accept(counter);
-        Ok(plaintext)
+        Ok(())
     }
 }
 
@@ -418,7 +441,6 @@ mod tests {
 
     use chacha20poly1305::aead::{AeadInPlace, KeyInit};
     use chacha20poly1305::ChaCha20Poly1305;
-    use snow::Builder;
 
     use super::{
         add_mac1, transport_nonce, HandshakeInitiator, HandshakeResponder, WireGuardError,
@@ -445,7 +467,7 @@ mod tests {
 
         let params = NOISE_PATTERN.parse().unwrap();
         let psk = [0_u8; 32];
-        let mut server = Builder::new(params)
+        let mut server = crate::resolver::noise_builder(params)
             .prologue(PROLOGUE)
             .local_private_key(server_private.as_bytes())
             .psk(2, &psk)
@@ -523,15 +545,18 @@ mod tests {
         let mut server = response.session;
         let mut client = client.finish(&response.packet).unwrap();
 
-        let client_packet = client.encrypt(b"from client").unwrap();
-        assert_eq!(
-            &server.decrypt(&client_packet).unwrap()[..11],
-            b"from client"
-        );
-        let server_packet = server.encrypt(b"from server").unwrap();
-        assert_eq!(
-            &client.decrypt(&server_packet).unwrap()[..11],
-            b"from server"
-        );
+        let mut encrypted = Vec::with_capacity(128);
+        let mut plaintext = Vec::with_capacity(128);
+        client.encrypt_into(b"from client", &mut encrypted).unwrap();
+        server.decrypt_into(&encrypted, &mut plaintext).unwrap();
+        assert_eq!(&plaintext[..11], b"from client");
+
+        let encrypted_capacity = encrypted.capacity();
+        let plaintext_capacity = plaintext.capacity();
+        server.encrypt_into(b"from server", &mut encrypted).unwrap();
+        client.decrypt_into(&encrypted, &mut plaintext).unwrap();
+        assert_eq!(&plaintext[..11], b"from server");
+        assert_eq!(encrypted.capacity(), encrypted_capacity);
+        assert_eq!(plaintext.capacity(), plaintext_capacity);
     }
 }

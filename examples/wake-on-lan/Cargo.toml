@@ -30,3 +30,10 @@ serde_json = "1"
 
 [build-dependencies]
 embuild = { version = "0.33", features = ["espidf"] }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = "z"
+panic = "abort"
+strip = "debuginfo"

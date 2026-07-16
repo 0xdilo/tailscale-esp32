@@ -1,10 +1,11 @@
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce, Tag};
-use snow::{Builder, HandshakeState};
+use snow::HandshakeState;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::key::{Machine, PrivateKey, PublicKey};
+use super::resolver::noise_builder;
 
 const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 const PROLOGUE_PREFIX: &str = "Tailscale Control Protocol v";
@@ -39,7 +40,7 @@ impl NoiseInitiator {
     ) -> Result<Self, NoiseError> {
         let params = NOISE_PATTERN.parse()?;
         let prologue = format!("{PROLOGUE_PREFIX}{version}");
-        let mut builder = Builder::new(params)
+        let mut builder = noise_builder(params)
             .local_private_key(machine_key.as_bytes())
             .remote_public_key(control_key.as_bytes())
             .prologue(prologue.as_bytes());
@@ -242,7 +243,6 @@ pub enum NoiseError {
 mod tests {
     use chacha20poly1305::aead::{AeadInPlace, KeyInit};
     use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-    use snow::Builder;
 
     use super::{
         NoiseInitiator, NoiseTransport, TransportCipher, MAX_PLAINTEXT_LEN, NOISE_PATTERN,
@@ -273,7 +273,7 @@ mod tests {
 
         let params = NOISE_PATTERN.parse().unwrap();
         let prologue = format!("{PROLOGUE_PREFIX}{VERSION}");
-        let mut server = Builder::new(params)
+        let mut server = crate::resolver::noise_builder(params)
             .local_private_key(control.as_bytes())
             .fixed_ephemeral_key_for_testing_only(server_ephemeral.as_bytes())
             .prologue(prologue.as_bytes())

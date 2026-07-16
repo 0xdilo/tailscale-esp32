@@ -17,6 +17,7 @@ pub mod identity;
 pub mod key;
 pub mod netmap;
 pub mod noise;
+mod resolver;
 pub mod stun;
 pub mod wireguard;
 

@@ -1,6 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
 
-use crypto_box::aead::{Aead, AeadCore, OsRng};
+use crypto_box::aead::Aead;
 use crypto_box::{PublicKey as BoxPublicKey, SalsaBox, SecretKey as BoxSecretKey};
 use thiserror::Error;
 
@@ -62,9 +62,13 @@ pub fn seal_pong(
         &BoxPublicKey::from(*remote_public.as_bytes()),
         &BoxSecretKey::from(*local_private.as_bytes()),
     );
-    let nonce = SalsaBox::generate_nonce(&mut OsRng);
+    let mut nonce = [0_u8; 24];
+    getrandom::getrandom(&mut nonce).map_err(|_| DiscoError::Random)?;
     let ciphertext = cipher
-        .encrypt(&nonce, plaintext.as_slice())
+        .encrypt(
+            crypto_box::aead::generic_array::GenericArray::from_slice(&nonce),
+            plaintext.as_slice(),
+        )
         .map_err(|_| DiscoError::Authentication)?;
     let mut packet = Vec::with_capacity(HEADER_LEN + ciphertext.len());
     packet.extend_from_slice(MAGIC);
@@ -89,13 +93,15 @@ pub enum DiscoError {
     Authentication,
     #[error("Tailscale discovery packet is not a supported ping")]
     NotPing,
+    #[error("random generation for Tailscale discovery failed")]
+    Random,
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
 
-    use crypto_box::aead::{Aead, AeadCore, OsRng};
+    use crypto_box::aead::{Aead, AeadCore};
     use crypto_box::{PublicKey as BoxPublicKey, SalsaBox, SecretKey as BoxSecretKey};
 
     use super::{open_ping, seal_pong, HEADER_LEN, MAGIC};
@@ -115,8 +121,13 @@ mod tests {
             &BoxPublicKey::from(*receiver.public().as_bytes()),
             &BoxSecretKey::from(*sender.as_bytes()),
         );
-        let nonce = SalsaBox::generate_nonce(&mut OsRng);
-        let encrypted = cipher.encrypt(&nonce, ping.as_slice()).unwrap();
+        let nonce = [0x55; 24];
+        let encrypted = cipher
+            .encrypt(
+                crypto_box::aead::generic_array::GenericArray::from_slice(&nonce),
+                ping.as_slice(),
+            )
+            .unwrap();
         let mut packet = MAGIC.to_vec();
         packet.extend_from_slice(sender.public().as_bytes());
         packet.extend_from_slice(&nonce);

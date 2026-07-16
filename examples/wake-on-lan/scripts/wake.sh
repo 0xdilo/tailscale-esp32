@@ -24,7 +24,7 @@ set +a
 
 timestamp="$(date +%s)"
 nonce="$(openssl rand -hex 16)"
-canonical="$(printf 'tailscale-esp32-wake-v1\n%s\n%s\nPOST\n%s' "$timestamp" "$nonce" "$WAKE_PATH")"
+canonical="$(printf 'esp32wake-v1\n%s\n%s\nPOST\n%s' "$timestamp" "$nonce" "$WAKE_PATH")"
 signature="$(
     printf '%s' "$canonical" \
         | openssl dgst -sha256 -hmac "$WAKE_TOKEN" -binary \

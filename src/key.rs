@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::fmt;
 use std::marker::PhantomData;
 
@@ -153,6 +154,18 @@ impl<K: KeyKind> PartialEq for PublicKey<K> {
 }
 
 impl<K: KeyKind> Eq for PublicKey<K> {}
+
+impl<K: KeyKind> PartialOrd for PublicKey<K> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<K: KeyKind> Ord for PublicKey<K> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.bytes.cmp(&other.bytes)
+    }
+}
 
 impl<K: KeyKind> Default for PublicKey<K> {
     fn default() -> Self {

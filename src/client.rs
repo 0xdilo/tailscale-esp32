@@ -128,13 +128,13 @@ impl<S: Read + Write> ControlConnection<S> {
         &mut self,
         path: &str,
         body: &T,
-        load_balance_keys: &[String],
+        load_balance_keys: &[&str],
         max_response_len: usize,
     ) -> Result<Response, ControlClientError> {
         let body = serde_json::to_vec(body)?;
         let headers: Vec<_> = load_balance_keys
             .iter()
-            .map(|key| ("ts-lb", key.as_str()))
+            .map(|key| ("ts-lb", *key))
             .collect();
         self.request("POST", path, &body, &headers, max_response_len)
     }
@@ -143,7 +143,7 @@ impl<S: Read + Write> ControlConnection<S> {
         &mut self,
         path: &str,
         body: &T,
-        load_balance_keys: &[String],
+        load_balance_keys: &[&str],
         max_response_len: usize,
     ) -> Result<R, ControlClientError> {
         let response = self.post_json(path, body, load_balance_keys, max_response_len)?;

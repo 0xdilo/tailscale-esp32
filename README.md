@@ -104,6 +104,19 @@ See [`examples/wake-on-lan`](examples/wake-on-lan) for a complete ESP-IDF
 application that registers a node, maintains direct connectivity, enforces the
 tailnet packet filter, and dispatches authenticated application packets.
 
+## Examples
+
+The [`examples`](examples) directory also contains small, host-runnable
+application patterns that can be moved into an ESP-IDF data-plane task:
+
+- an ACL-protected GPIO or relay command endpoint;
+- a request/response temperature sensor with direct-to-DERP path fallback;
+- an in-place ICMP status light.
+
+Each example starts at the boundary where WireGuard has already authenticated
+and decrypted a packet. The Wake-on-LAN firmware remains the complete reference
+for Wi-Fi, enrollment, control maps, WireGuard, DISCO, and DERP integration.
+
 ## Development
 
 Host-side validation:

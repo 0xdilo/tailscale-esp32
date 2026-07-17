@@ -33,7 +33,7 @@ use tailscale_esp32::netmap::{icmp_echo_reply_in_place, parse_udp_packet, Networ
 use tailscale_esp32::stun::{binding_request, parse_binding_response};
 use tailscale_esp32::wireguard::{HandshakeResponder, WireGuardSession};
 use tailscale_esp32::CAPABILITY_VERSION;
-use tailscale_esp32_wake_example::{magic_packet, parse_mac, verify_wake_request};
+use tailscale_esp32_wake_example::{magic_packet, parse_mac, verify_wake_request, DASHBOARD_HTML};
 
 const WIFI_SSID: &str = env!("WIFI_SSID");
 const WIFI_PASS: &str = env!("WIFI_PASS");
@@ -79,16 +79,35 @@ fn main() -> Result<()> {
     wait_for_time_sync(&sntp)?;
 
     let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
-    info!("ready: http://{}/health", ip_info.ip);
+    info!("dashboard: http://{}/", ip_info.ip);
     info!("wake target: {WAKE_MAC}");
 
     let mut server = EspHttpServer::new(&esp_idf_svc::http::server::Configuration {
         stack_size: SERVER_STACK_SIZE,
         max_sessions: 2,
         max_open_sockets: 2,
-        max_uri_handlers: 2,
-        max_resp_headers: 4,
+        max_uri_handlers: 3,
+        max_resp_headers: 6,
         ..Default::default()
+    })?;
+
+    server.fn_handler("/", Method::Get, |request| {
+        request
+            .into_response(
+                200,
+                Some("OK"),
+                &[
+                    ("Content-Type", "text/html; charset=utf-8"),
+                    ("Cache-Control", "no-store"),
+                    ("X-Content-Type-Options", "nosniff"),
+                    (
+                        "Content-Security-Policy",
+                        "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
+                    ),
+                ],
+            )?
+            .write_all(DASHBOARD_HTML.as_bytes())
+            .map(|_| ())
     })?;
 
     server.fn_handler("/health", Method::Get, |request| {

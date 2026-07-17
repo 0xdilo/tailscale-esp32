@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>tailscale-esp32</title>
+  <style>
+    :root{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#e9e7ff;background:#0d0b16}
+    *{box-sizing:border-box}
+    body{min-height:100vh;margin:0;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at top,#292044 0,#0d0b16 52%)}
+    main{width:min(100%,560px);padding:30px;border:1px solid #514474;border-radius:24px;background:#171326;box-shadow:0 24px 80px #0008}
+    header{display:flex;align-items:center;justify-content:space-between;gap:16px}
+    h1{margin:0;font-size:clamp(1.25rem,5vw,1.8rem);letter-spacing:-.06em}
+    .online{display:flex;align-items:center;gap:8px;color:#9ff7c7;font-size:.78rem}
+    .dot{width:9px;height:9px;border-radius:50%;background:#66e49c;box-shadow:0 0 14px #66e49c}
+    .cat{margin:30px 0 24px;color:#cbb8ff;text-align:center;font-size:1.05rem;line-height:1.2}
+    .copy{color:#aaa4bd;line-height:1.65}
+    .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin:24px 0}
+    .card{padding:15px;border:1px solid #39304f;border-radius:14px;background:#110e1c}
+    .label{display:block;margin-bottom:7px;color:#777085;font-size:.68rem;text-transform:uppercase;letter-spacing:.12em}
+    .value{color:#f4f0ff;font-size:.9rem}
+    a{display:block;padding:13px 16px;border:1px solid #7661a7;border-radius:12px;color:#e9e0ff;text-align:center;text-decoration:none;background:#2a2140}
+    a:focus,a:hover{background:#382c55;border-color:#a58bdc}
+    footer{margin-top:18px;color:#6f687d;text-align:center;font-size:.68rem}
+    @media(max-width:430px){main{padding:22px}.grid{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>tailscale-esp32</h1>
+      <span class="online"><span class="dot"></span>online</span>
+    </header>
+    <pre class="cat" aria-label="happy cat"> /\_/\\
+( o.o )
+ &gt; ^ &lt;</pre>
+    <p class="copy">Your tiny tailnet node is awake and ready to guard the sleeping machines.</p>
+    <section class="grid">
+      <div class="card"><span class="label">Network</span><span class="value">Wi-Fi station</span></div>
+      <div class="card"><span class="label">Identity</span><span class="value">NVS-backed</span></div>
+      <div class="card"><span class="label">Wake guards</span><span class="value">HMAC + ACL</span></div>
+      <div class="card"><span class="label">Assets</span><span class="value">embedded in flash</span></div>
+    </section>
+    <a href="/health">Open health endpoint</a>
+    <footer>served directly from ESP32 flash · no cloud assets</footer>
+  </main>
+</body>
+</html>

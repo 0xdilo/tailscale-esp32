@@ -1,6 +1,7 @@
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
+pub const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 pub const MAGIC_PACKET_LEN: usize = 102;
 pub const MAX_CLOCK_SKEW_SECONDS: u64 = 90;
 
@@ -95,7 +96,8 @@ fn decode_signature(value: &str) -> Result<[u8; 32], AuthError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        magic_packet, parse_mac, verify_wake_request, wake_signature, AuthError, MAGIC_PACKET_LEN,
+        magic_packet, parse_mac, verify_wake_request, wake_signature, AuthError, DASHBOARD_HTML,
+        MAGIC_PACKET_LEN,
     };
 
     const SECRET: &[u8] = b"a-long-test-secret-that-is-not-production";
@@ -125,6 +127,15 @@ mod tests {
         assert_eq!(packet.len(), MAGIC_PACKET_LEN);
         assert_eq!(&packet[..6], &[0xff; 6]);
         assert!(packet[6..].chunks_exact(6).all(|chunk| chunk == mac));
+    }
+
+    #[test]
+    fn embeds_a_self_contained_dashboard() {
+        assert!(DASHBOARD_HTML.starts_with("<!doctype html>"));
+        assert!(DASHBOARD_HTML.contains("tailscale-esp32"));
+        assert!(DASHBOARD_HTML.contains("href=\"/health\""));
+        assert!(!DASHBOARD_HTML.contains("<script"));
+        assert!(!DASHBOARD_HTML.contains("https://"));
     }
 
     #[test]

@@ -13,6 +13,11 @@ The application supports two wake paths:
 
 The local signed HTTP endpoint is retained as a recovery fallback.
 
+The firmware also serves a small, self-contained status dashboard from flash
+at `http://<esp32-lan-address>/`. It performs no external requests and keeps
+the wake secret out of the page. Use `/health` for machine-readable health
+checks and the signed scripts below for wake requests.
+
 ## Hardware assumptions
 
 - ESP32-S3 with 8 MiB octal PSRAM and 16 MiB flash

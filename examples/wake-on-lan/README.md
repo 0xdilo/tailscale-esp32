@@ -23,9 +23,9 @@ The local signed HTTP endpoint is retained as a recovery fallback.
 Adjust `sdkconfig.defaults` and `.cargo/config.toml` for another ESP32 variant.
 The defaults deliberately target low traffic and low idle power: dynamic
 frequency scaling, automatic light sleep, modem sleep, bounded Wi-Fi pools,
-PSRAM for larger allocations, and size-optimized LTO are enabled. See the
-[measured optimization notes](../../docs/optimization.md) before reusing these
-limits for a higher-throughput application.
+PSRAM for larger allocations, and size-optimized LTO are enabled. Review and
+retune these limits before reusing the firmware for a higher-throughput
+application.
 
 ## Configure and flash
 

@@ -19,7 +19,6 @@ by Tailscale Inc.
 > before selecting it for a deployment.
 
 The ESP32-S3 reference build is tuned for constrained always-on appliances.
-See the measured [footprint, memory, and idle-power optimizations](docs/optimization.md).
 
 ## What is implemented
 

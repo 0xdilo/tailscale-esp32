@@ -127,3 +127,7 @@ selected home DERP region. Direct UDP is preferred; WireGuard packets fall back
 to DERP when a firewall or difficult NAT prevents a direct path. The control
 connection uses resumable streaming maps and republishes endpoint or preferred
 DERP changes without losing its persistent node identity.
+
+The Wi-Fi watchdog checks association and DHCP health every five seconds. It
+reconnects after an access-point interruption and republishes the local
+Tailscale endpoint if DHCP assigns a different address.

@@ -57,6 +57,8 @@ const STUN_INTERVAL: Duration = Duration::from_secs(20);
 const CONTROL_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const CONTROL_KEY_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
 const PING_WAKE_COOLDOWN: Duration = Duration::from_secs(30);
+const WIFI_HEALTH_INTERVAL: Duration = Duration::from_secs(5);
+const WIFI_WATCHDOG_STACK_SIZE: usize = 8192;
 
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
@@ -81,6 +83,9 @@ fn main() -> Result<()> {
     let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
     info!("dashboard: http://{}/", ip_info.ip);
     info!("wake target: {WAKE_MAC}");
+    let local_endpoint = format!("{}:{TAILSCALE_WIREGUARD_PORT}", ip_info.ip);
+    let endpoints = Arc::new(Mutex::new(vec![(local_endpoint, ENDPOINT_TYPE_LOCAL)]));
+    let endpoint_generation = Arc::new(AtomicU32::new(0));
 
     let mut server = EspHttpServer::new(&esp_idf_svc::http::server::Configuration {
         stack_size: SERVER_STACK_SIZE,
@@ -170,9 +175,6 @@ fn main() -> Result<()> {
         Ok(keys) => {
             let keys = Arc::new(keys);
             let network_map = Arc::new(Mutex::new(NetworkMap::default()));
-            let local_endpoint = format!("{}:{TAILSCALE_WIREGUARD_PORT}", ip_info.ip);
-            let endpoints = Arc::new(Mutex::new(vec![(local_endpoint, ENDPOINT_TYPE_LOCAL)]));
-            let endpoint_generation = Arc::new(AtomicU32::new(0));
             let preferred_derp = Arc::new(AtomicU16::new(0));
             let (probe_sender, probe_receiver) = sync_channel(8);
             std::thread::Builder::new()
@@ -203,6 +205,7 @@ fn main() -> Result<()> {
                     let network_map = network_map.clone();
                     let used_nonces = used_nonces.clone();
                     let endpoint_generation = endpoint_generation.clone();
+                    let endpoints = endpoints.clone();
                     move || {
                         tailscale_data_loop(
                             keys,
@@ -218,20 +221,29 @@ fn main() -> Result<()> {
             std::thread::Builder::new()
                 .name("tailscale-derp".into())
                 .stack_size(TAILSCALE_DERP_STACK_SIZE)
-                .spawn(move || {
-                    tailscale_derp_loop(
-                        keys,
-                        network_map,
-                        endpoint_generation,
-                        preferred_derp,
-                        probe_sender,
-                        used_nonces,
-                    )
+                .spawn({
+                    let endpoint_generation = endpoint_generation.clone();
+                    move || {
+                        tailscale_derp_loop(
+                            keys,
+                            network_map,
+                            endpoint_generation,
+                            preferred_derp,
+                            probe_sender,
+                            used_nonces,
+                        )
+                    }
                 })
                 .context("could not start Tailscale DERP task")?;
         }
         Err(error) => warn!("Tailscale identity unavailable: {error:#}"),
     }
+
+    std::thread::Builder::new()
+        .name("wifi-watchdog".into())
+        .stack_size(WIFI_WATCHDOG_STACK_SIZE)
+        .spawn(move || wifi_watchdog_loop(wifi, endpoints, endpoint_generation))
+        .context("could not start Wi-Fi watchdog task")?;
 
     loop {
         std::thread::sleep(Duration::from_secs(60));
@@ -287,30 +299,34 @@ fn tailscale_control_loop(
             }
         }
         let control_key = cached_control_key.expect("control key initialized above");
-        if let Err(error) = tailscale_control_session(
-            &keys,
-            control_key,
-            &mut followup,
-            &network_map,
-            &endpoints,
-            &endpoint_generation,
-            &preferred_derp,
-            &mut map_resume,
-        ) {
+        let context = ControlContext {
+            keys: &keys,
+            network_map: &network_map,
+            endpoints: &endpoints,
+            endpoint_generation: &endpoint_generation,
+            preferred_derp: &preferred_derp,
+        };
+        if let Err(error) =
+            tailscale_control_session(&context, control_key, &mut followup, &mut map_resume)
+        {
             warn!("Tailscale control session failed: {error:#}");
         }
         std::thread::sleep(CONTROL_RETRY_INTERVAL);
     }
 }
 
+struct ControlContext<'a> {
+    keys: &'a DeviceIdentity,
+    network_map: &'a Mutex<NetworkMap>,
+    endpoints: &'a Mutex<Vec<(String, u8)>>,
+    endpoint_generation: &'a AtomicU32,
+    preferred_derp: &'a AtomicU16,
+}
+
 fn tailscale_control_session(
-    keys: &DeviceIdentity,
+    context: &ControlContext<'_>,
     control_key: tailscale_esp32::key::PublicKey<Machine>,
     followup: &mut Option<String>,
-    network_map: &Mutex<NetworkMap>,
-    endpoints: &Mutex<Vec<(String, u8)>>,
-    endpoint_generation: &AtomicU32,
-    preferred_derp: &AtomicU16,
     map_resume: &mut MapResume,
 ) -> Result<()> {
     let stream =
@@ -320,19 +336,19 @@ fn tailscale_control_session(
     let mut control = ControlConnection::upgrade(
         stream,
         CONTROL_HOST,
-        keys.machine_key(),
+        context.keys.machine_key(),
         control_key,
         CAPABILITY_VERSION,
     )
     .context("Tailscale control upgrade failed")?;
 
-    let node_key = keys.node_key().public();
+    let node_key = context.keys.node_key().public();
     let load_balance_key = node_key.to_string();
     let mut registration = RegisterRequest::new(
         CAPABILITY_VERSION,
         node_key,
-        keys.network_lock_key().public(),
-        host_info(keys, preferred_derp.load(Ordering::Acquire)),
+        context.keys.network_lock_key().public(),
+        host_info(context.keys, context.preferred_derp.load(Ordering::Acquire)),
     );
     if let Some(url) = followup.as_ref() {
         info!("waiting for Tailscale approval at: {url}");
@@ -365,24 +381,13 @@ fn tailscale_control_session(
     }
     *followup = None;
 
-    let advertised_generation = endpoint_generation.load(Ordering::Acquire);
-    update_network_map(
-        keys,
-        node_key,
-        &load_balance_key,
-        &mut control,
-        network_map,
-        endpoints,
-        preferred_derp,
-    )?;
+    let advertised_generation = context.endpoint_generation.load(Ordering::Acquire);
+    update_network_map(context, node_key, &load_balance_key, &mut control)?;
     stream_network_maps(
-        keys,
+        context,
         node_key,
         &load_balance_key,
         &mut control,
-        network_map,
-        endpoint_generation,
-        preferred_derp,
         advertised_generation,
         map_resume,
     )
@@ -395,21 +400,18 @@ struct MapResume {
 }
 
 fn stream_network_maps(
-    keys: &DeviceIdentity,
+    context: &ControlContext<'_>,
     node_key: tailscale_esp32::key::PublicKey<Node>,
     load_balance_key: &str,
     control: &mut ControlConnection<TcpStream>,
-    network_map: &Mutex<NetworkMap>,
-    endpoint_generation: &AtomicU32,
-    preferred_derp: &AtomicU16,
     advertised_generation: u32,
     resume: &mut MapResume,
 ) -> Result<()> {
     let request = MapRequest::new(
         CAPABILITY_VERSION,
         node_key,
-        keys.disco_key().public(),
-        host_info(keys, preferred_derp.load(Ordering::Acquire)),
+        context.keys.disco_key().public(),
+        host_info(context.keys, context.preferred_derp.load(Ordering::Acquire)),
     )
     .streaming()
     .resume(resume.handle.clone(), resume.sequence);
@@ -444,7 +446,8 @@ fn stream_network_maps(
                 let maps = decoder
                     .push(&payload)
                     .context("could not decode streaming Tailscale map")?;
-                let mut current = network_map
+                let mut current = context
+                    .network_map
                     .lock()
                     .map_err(|_| anyhow::anyhow!("network map lock poisoned"))?;
                 for map in maps {
@@ -457,7 +460,7 @@ fn stream_network_maps(
                     current.apply(map);
                 }
                 drop(current);
-                if endpoint_generation.load(Ordering::Acquire) != advertised_generation {
+                if context.endpoint_generation.load(Ordering::Acquire) != advertised_generation {
                     bail!("Tailscale endpoints changed; reconnecting the map stream");
                 }
                 if end_stream {
@@ -469,21 +472,19 @@ fn stream_network_maps(
 }
 
 fn update_network_map(
-    keys: &DeviceIdentity,
+    context: &ControlContext<'_>,
     node_key: tailscale_esp32::key::PublicKey<Node>,
     load_balance_key: &str,
     control: &mut ControlConnection<TcpStream>,
-    network_map: &Mutex<NetworkMap>,
-    endpoints: &Mutex<Vec<(String, u8)>>,
-    preferred_derp: &AtomicU16,
 ) -> Result<()> {
     let mut map_request = MapRequest::new(
         CAPABILITY_VERSION,
         node_key,
-        keys.disco_key().public(),
-        host_info(keys, preferred_derp.load(Ordering::Acquire)),
+        context.keys.disco_key().public(),
+        host_info(context.keys, context.preferred_derp.load(Ordering::Acquire)),
     );
-    let endpoints = endpoints
+    let endpoints = context
+        .endpoints
         .lock()
         .map_err(|_| anyhow::anyhow!("endpoint lock poisoned"))?;
     for (endpoint, kind) in endpoints.iter() {
@@ -516,7 +517,8 @@ fn update_network_map(
         .map_or("unknown", String::as_str);
     let peer_count = first.peers.as_ref().map_or(0, Vec::len);
     info!("Tailscale control ready: addresses={addresses}, peers={peer_count}");
-    let mut current = network_map
+    let mut current = context
+        .network_map
         .lock()
         .map_err(|_| anyhow::anyhow!("network map lock poisoned"))?;
     for map in maps {
@@ -1204,6 +1206,74 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<()> {
     info!("Wi-Fi started; connecting to {WIFI_SSID}");
     wifi.connect().context("Wi-Fi association failed")?;
     wifi.wait_netif_up().context("Wi-Fi DHCP failed")?;
+    Ok(())
+}
+
+fn wifi_watchdog_loop(
+    mut wifi: BlockingWifi<EspWifi<'static>>,
+    endpoints: Arc<Mutex<Vec<(String, u8)>>>,
+    endpoint_generation: Arc<AtomicU32>,
+) {
+    loop {
+        std::thread::sleep(WIFI_HEALTH_INTERVAL);
+        let healthy = match wifi_is_healthy(&wifi) {
+            Ok(healthy) => healthy,
+            Err(error) => {
+                warn!("Wi-Fi health check failed: {error:#}");
+                false
+            }
+        };
+        if !healthy {
+            warn!("Wi-Fi connection lost; reconnecting");
+            if let Err(error) = recover_wifi(&mut wifi) {
+                warn!("Wi-Fi recovery failed: {error:#}");
+                continue;
+            }
+            info!("Wi-Fi connection restored");
+        }
+
+        let ip_info = match wifi.wifi().sta_netif().get_ip_info() {
+            Ok(ip_info) => ip_info,
+            Err(error) => {
+                warn!("could not refresh Wi-Fi address: {error}");
+                continue;
+            }
+        };
+        let local_endpoint = format!("{}:{TAILSCALE_WIREGUARD_PORT}", ip_info.ip);
+        let mut current = match endpoints.lock() {
+            Ok(current) => current,
+            Err(_) => {
+                warn!("endpoint lock poisoned while refreshing Wi-Fi address");
+                continue;
+            }
+        };
+        let changed = current
+            .iter()
+            .find(|(_, kind)| *kind == ENDPOINT_TYPE_LOCAL)
+            .is_none_or(|(endpoint, _)| endpoint != &local_endpoint);
+        if changed {
+            current.retain(|(_, kind)| *kind != ENDPOINT_TYPE_LOCAL);
+            current.push((local_endpoint.clone(), ENDPOINT_TYPE_LOCAL));
+            endpoint_generation.fetch_add(1, Ordering::Release);
+            info!("Tailscale local endpoint updated: {local_endpoint}");
+        }
+    }
+}
+
+fn wifi_is_healthy(wifi: &BlockingWifi<EspWifi<'static>>) -> Result<bool> {
+    Ok(wifi.is_started()? && wifi.is_connected()? && wifi.is_up()?)
+}
+
+fn recover_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<()> {
+    if !wifi.is_started()? {
+        wifi.start().context("Wi-Fi driver restart failed")?;
+    }
+    if !wifi.is_connected()? {
+        wifi.connect().context("Wi-Fi reassociation failed")?;
+    }
+    if !wifi.is_up()? {
+        wifi.wait_netif_up().context("Wi-Fi DHCP recovery failed")?;
+    }
     Ok(())
 }
 
